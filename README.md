@@ -1,23 +1,43 @@
 # Thermowatt Smart Boiler Bridge for Home Assistant
 
-This add-on allows you to integrate Thermowatt-based smart water heaters into Home Assistant using MQTT. It bridges the gap between the Thermowatt cloud and your local Home Assistant instance.
+This add-on bridges Thermowatt-based smart water heaters into Home Assistant via local MQTT. It polls the Thermowatt cloud API, publishes device state as MQTT Discovery entities, and routes HA commands back to the cloud — with safety hardening for use as an EMS-controlled deferrable load.
 
-[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2Fwaterheater-dev%2Fha-thermowatt-heater)
+[![Open your Home Assistant instance and show the add add-on repository dialog with a specific repository URL pre-filled.](https://my.home-assistant.io/badges/supervisor_add_addon_repository.svg)](https://my.home-assistant.io/redirect/supervisor_add_addon_repository/?repository_url=https%3A%2F%2Fgithub.com%2FMMicieli%2Fha-thermowatt-heater)
 
 ## Features
 
-- **Real-time Monitoring**: Track current water temperature (`T_Avg`).
-- **Full Control**: Set target temperatures and toggle between Manual/Auto modes.
-- **MQTT Discovery**: Automatically creates a "Water Heater" device in Home Assistant.
-- **Diagnostic Sensors**: Monitor errors and system status.
+- **Real-time Monitoring**: Tank temperature via `T_Avg` (firmware average — more accurate than display value)
+- **Full Control**: Set target temperatures and operation modes (Manual / Eco / Auto / Holiday / Off)
+- **MQTT Discovery**: Automatically creates a Water Heater device with 9 sensors + 1 binary sensor
+- **EMS-ready Sensors**: Dedicated first-class entities for `T_Avg`, `T_dsrd`, `TBoost`, `TAmb`, `Time_eco`, `Time_prog`, `Rssi`, `WaterHeaterSts`, and `last_polled_at` — directly loggable to InfluxDB
+- **Availability Tracking**: MQTT LWT publishes `offline` when bridge stops; all entities show unavailable in HA
+- **Stale Data Protection**: `last_polled_at` timestamp enables HA-side stale detection
+- **Safety Hardening**: Server-side temperature clamp (20–70°C), retained command rejection, HTTP timeouts, clean shutdown
+
+## Entities Created
+
+| Entity | Type | Description |
+|---|---|---|
+| `water_heater.<name>` | Water Heater | Mode and temperature control |
+| `binary_sensor.<name>_heating` | Binary Sensor | Element active state |
+| `sensor.<name>_average_temperature` | Sensor | T_Avg — firmware average tank temp |
+| `sensor.<name>_desired_temperature` | Sensor | T_dsrd — current target setpoint |
+| `sensor.<name>_boost_ceiling` | Sensor | TBoost — maximum boost temperature |
+| `sensor.<name>_ambient_temperature` | Sensor | TAmb — installation environment temp |
+| `sensor.<name>_eco_runtime` | Sensor | Time_eco — eco mode runtime counter |
+| `sensor.<name>_programme_runtime` | Sensor | Time_prog — programme runtime counter |
+| `sensor.<name>_wifi_signal` | Sensor | Rssi — WiFi signal strength |
+| `sensor.<name>_water_heater_status_raw` | Sensor | WaterHeaterSts — raw status bitmask |
+| `sensor.<name>_last_polled` | Sensor | last_polled_at — UTC timestamp of last successful poll |
 
 ## Installation
 
-1. Prerequisite: Install and start Mosquitto MQTT broker within Home Assistant.
-2. Click the **Add Repository** button above, or manually add `https://github.com/waterheater-dev/ha-thermowatt-heater` to your Home Assistant Add-on Store.
+1. Install and start the **Mosquitto MQTT** broker add-on in Home Assistant.
+2. Click **Add Repository** above, or manually add this repository URL to your HA Add-on Store:
+   `https://github.com/MMicieli/ha-thermowatt-heater`
 3. Install the **Thermowatt Smart Boiler** add-on.
-4. Configure your Thermowatt account credentials in the **Configuration** tab.
-5. Start the add-on.
+4. Enter your MyThermowatt credentials in the **Configuration** tab.
+5. Start the add-on and check the **Log** tab.
 
 ## Configuration
 
@@ -26,50 +46,51 @@ email: "your-email@example.com"
 password: "your-password"
 ```
 
-## Dashboard
+### Optional environment variables
 
-Once the add-on is running, a new entity will appear under your MQTT integration. We recommend using the Thermostat Card for the best experience.
+| Variable | Default | Description |
+|---|---|---|
+| `THERMOWATT_TLS_NO_VERIFY` | `0` | Set to `1` to disable TLS certificate verification (debug only) |
+| `MQTT_HOST` | `core-mosquitto` | MQTT broker hostname |
+| `MQTT_PORT` | `1883` | MQTT broker port |
+| `MQTT_USER` | — | MQTT username if required |
+| `MQTT_PASSWORD` | — | MQTT password if required |
 
-## Troubleshooting
+## Polling Behaviour
 
-The add-on will log each step of its boot cycle, so that in case of a problem, you will be aware of exactly which step failed. A healthy log should look like this:
+| Mode | Interval | When |
+|---|---|---|
+| Normal | 60s | Default operation |
+| Post-command | 20s | 60s window after a command is sent |
+| Backoff | 120s–180s | After a 429 rate-limit response |
 
-```code
-s6-rc: info: service s6rc-oneshot-runner: starting
-s6-rc: info: service s6rc-oneshot-runner successfully started
-s6-rc: info: service fix-attrs: starting
-s6-rc: info: service fix-attrs successfully started
-s6-rc: info: service legacy-cont-init: starting
-s6-rc: info: service legacy-cont-init successfully started
-s6-rc: info: service legacy-services: starting
-s6-rc: info: service legacy-services successfully started
-[21:51:03] INFO: Starting Thermowatt Bridge for <email@example.com>...
+## Safety Design
+
+- Temperature commands are clamped to 20–70°C server-side before reaching the API (firmware `T_set_max: 70`)
+- Retained MQTT command messages are ignored on restart — prevents stale command replay
+- All cloud API calls have a (5s connect, 15s read) timeout — prevents hung requests freezing polling
+- Bridge publishes `offline` to availability topic on both clean shutdown and unclean disconnect (LWT)
+- SIGTERM from HA Supervisor triggers clean shutdown path
+
+## Healthy Boot Log
 --- BOOT SEQUENCE START ---
 OK: Step 1 - Credentials present.
-OK: Step 2 & 3 - Connected and authenticated with local MQTT.
+OK: Step 2 & 3 - Connected to MQTT. Availability: online.
 OK: Step 4 - Logged in to Thermowatt backend.
 OK: Step 5 - Found 1 thermostats.
-🌉 Bridge active for: Home (3012340231805353)
+🌉 Bridge active for: HWS (4032429241482944)
 OK: Step 6 - Booted successfully.
-OK: Step 7 - Starting polling loop (interval: 20s).
-[STATUS] Polled 16 times, got 16 x 200, 0 errors
-[STATUS] Polled 15 times, got 15 x 200, 0 errors
-[STATUS] Polled 15 times, got 15 x 200, 0 errors
-[STATUS] Polled 15 times, got 15 x 200, 0 errors
-```
+OK: Step 7 - Starting polling loop (normal=60s, confirm=20s).
+[STATUS] Polled 5 times, got 5 x 200, 0 errors, interval=60s
 
-## Known to work on:
+## Known to Work On
 
-- **Home Assistant:**
-  - _Installation method:_ Home Assistant OS
-  - _Core:_ 2025.12.5
-  - _Supervisor:_ 2026.01.1
-  - _Operating System:_ 16.3
-  - _Frontend:_ 20251203.3
-- **Mosquitto MQTT Version:** 6.5.2
-- **MyThermowatt App Version:** 3.14
+- **Home Assistant OS** — Core 2025.12.5, Supervisor 2026.01.1, OS 16.3, Frontend 20251203.3
+- **Mosquitto MQTT** 6.5.2
+- **MyThermowatt App** 3.14
+- **Thermann** (Australian Reece brand) — confirmed working
 
-Tip: Help others by adding your version here, if it works.
+_Tip: Help others by adding your version here if it works._
 
 ---
 
@@ -77,8 +98,8 @@ _Disclaimer: This project is not affiliated with or endorsed by Thermowatt or Ar
 
 ---
 
-### Support my work
+### Support the original author
 
-If this add-on saved you some frustration or made your home a bit smarter or helped someone avoid a cold shower, feel free to [buy me a beer on Ko-fi!](https://ko-fi.com/thermohacker)
+If this add-on saved you some frustration, feel free to [buy waterheater-dev a beer on Ko-fi!](https://ko-fi.com/thermohacker)
 
 [![support](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/thermohacker)
