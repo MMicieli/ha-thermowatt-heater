@@ -3,6 +3,8 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+> **Fork note:** This repository is forked from [waterheater-dev/ha-thermowatt-heater](https://github.com/waterheater-dev/ha-thermowatt-heater) at v1.3.0. Versions 1.0.0–1.3.0 reflect upstream history. Changes from v1.4.0 onwards are specific to this fork.
+
 ## [1.5.2] - 2026-05-08
 ### Fixed
 - Replace deprecated `datetime.utcnow()` with timezone-aware `datetime.now(UTC)` (Python 3.12 compatibility)
@@ -24,7 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - max_temp corrected 75°C → 70°C (matches confirmed firmware T_set_max)
 - Time_eco / Time_prog state_class: total_increasing → measurement (unconfirmed counter behaviour)
 - TLS verify=False now opt-in only via THERMOWATT_TLS_NO_VERIFY env var (default: verify enabled)
-- Polling 60s normal / 20s post-command confirmation window
 
 ### Fixed
 - optimistic:True removed from water_heater discovery — contradicted mode_state_topic confirmed state
@@ -36,6 +37,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Binary sensor heating value_template case mismatch (Python True/False vs payload_on 'true')
 - Mode display broken when unit off (lowercase 'off' did not match operation_list 'Off')
 - Extra API call eliminated on every command (_inject_fake_status now deep-copies from cache)
+
+---
+
+## [1.4.0] - 2026-05-08
+> Not released as a standalone version — changes included in v1.5.1.
+### Added
+- Binary sensor for heating active state using WaterHeaterSts bitmask
+- Computed heating boolean injected into every poll and fake status
+- T_Avg used as current_temperature (more accurate than display value)
+- json_attributes_template exposing full result payload as HA attributes
+- Exponential backoff on 429 responses
+- 401 auto-refresh with session retry
+- Six dedicated MQTT sensor discoveries: T_Avg, T_dsrd, TBoost, Time_eco, Time_prog, Rssi, last_polled_at
+
+### Fixed
+- Binary sensor never fired — value_template rendered Python True/False, payload_on expected lowercase true
+- Mode display broken when unit off — Cmd 16 returned lowercase off, not matching operation_list Off
+- Extra API call on every command — _inject_fake_status now deep-copies from cache instead of live GET
+- No staleness detection — last_polled_at UTC timestamp added and exposed as dedicated sensor
+- EMS-critical fields buried in attributes — promoted to first-class sensor entities for InfluxDB logging
 
 ---
 
@@ -91,7 +112,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [1.5.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/1.3.0...v1.5.1
-[1.3.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.1.1...1.2.0
+[1.4.0]: https://github.com/MMicieli/ha-thermowatt-heater/compare/1.3.0...v1.5.1
+[1.3.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.2.0...1.3.0
 [1.2.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.1.1...1.2.0
 [1.1.1]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.0.0...1.1.0
