@@ -1,71 +1,87 @@
 # Changelog
-
 All notable changes to this project will be documented in this file.
-
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.3.0] - 2026-01-27
+## [1.5.2] - 2026-05-08
+### Fixed
+- Replace deprecated `datetime.utcnow()` with timezone-aware `datetime.now(UTC)` (Python 3.12 compatibility)
 
-### Removed
+---
 
-- AWS MQTT bridge for real-time status updates
-- Certificate-based AWS IoT authentication
-
+## [1.5.1] - 2026-05-08
 ### Added
+- MQTT LWT and availability_topic on all discovery payloads — entities show unavailable when bridge dies
+- TAmb (Ambient Temperature) as first-class sensor entity — required for Phase 2 thermal calibration
+- WaterHeaterSts raw integer as first-class sensor entity — for anomaly filtering in InfluxDB queries
+- HTTP_TIMEOUT = (5, 15) on all cloud API calls — prevents hung requests freezing polling
+- SIGTERM handler — HA Supervisor stop now triggers clean shutdown path
+- Post-command fast-poll confirmation window (20s for 60s after command, then resumes 60s)
 
-- Added polling loop to avoid rate limiting issues
+### Changed
+- Polling interval 20s → 60s normal operation (reduces cloud rate-limit risk, cleaner calibration data)
+- CMD_COOLDOWN 60s → 15s (was blocking valid paired set_temperature + set_operation_mode sequences)
+- max_temp corrected 75°C → 70°C (matches confirmed firmware T_set_max)
+- Time_eco / Time_prog state_class: total_increasing → measurement (unconfirmed counter behaviour)
+- TLS verify=False now opt-in only via THERMOWATT_TLS_NO_VERIFY env var (default: verify enabled)
+- Polling 60s normal / 20s post-command confirmation window
 
 ### Fixed
+- optimistic:True removed from water_heater discovery — contradicted mode_state_topic confirmed state
+- last_polled value_template returns none instead of string 'unknown' (HA timestamp device_class compatibility)
+- Retained MQTT commands ignored on restart — prevents stale CMD topic replay after bridge restart
+- Offline published explicitly on clean shutdown (LWT alone only fires on unclean disconnect)
+- Server-side temperature clamp max(20, min(70, temp)) — firmware silently rejects values above 70°C
+- Restored truncated last_polled_at sensor discovery payload (was missing 6 of 8 required keys)
+- Binary sensor heating value_template case mismatch (Python True/False vs payload_on 'true')
+- Mode display broken when unit off (lowercase 'off' did not match operation_list 'Off')
+- Extra API call eliminated on every command (_inject_fake_status now deep-copies from cache)
 
-- Rate limiting issues from frequent API polling, by performing polling in the correct, acceptable way.
+---
+
+## [1.3.0] - 2026-01-27
+### Removed
+- AWS MQTT bridge for real-time status updates
+- Certificate-based AWS IoT authentication
+### Added
+- Polling loop to avoid rate limiting issues
+### Fixed
+- Rate limiting issues from frequent API polling
 
 ---
 
 ## [1.2.0] - 2026-01-25
-
 ### Added
-
 - AWS MQTT bridge for real-time status updates (replaces polling)
 - Support for multiple devices with per-device AWS MQTT clients
 - Certificate-based AWS IoT authentication
 - Command cooldown mechanism to prevent stale status updates after commands
-
 ### Changed
-
 - Commands now use REST API (matching app behavior)
 - Status updates come from AWS MQTT instead of polling
 - Removed polling loop to avoid rate limiting issues
 - Updated status format handling to match AWS MQTT format
-
 ### Fixed
-
 - Rate limiting issues from frequent API polling
 - Status update cooldown after commands to prevent stale values overwriting optimistic updates
 
 ---
 
 ## [1.1.1] - 2026-01-24
-
 ### Changed
-
 - Polling interval set to 60 seconds
 - Updated HomeAssistant mode names to match app behavior
 
 ---
 
 ## [1.1.0] - 2026-01-24
-
 ### Changed
-
 - Upgraded to support breaking backend changes observed after the release of app version 3.14
 
 ---
 
 ## [1.0.0] - 2026-01-18
-
 ### Added
-
 - Initial release
 - Basic MQTT bridge functionality
 - Home Assistant discovery integration
@@ -73,6 +89,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[1.5.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.5.1...v1.5.2
+[1.5.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/1.3.0...v1.5.1
+[1.3.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.1.1...1.2.0
 [1.2.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.1.1...1.2.0
 [1.1.1]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.1.0...1.1.1
 [1.1.0]: https://github.com/waterheater-dev/ha-thermowatt-heater/compare/1.0.0...1.1.0
