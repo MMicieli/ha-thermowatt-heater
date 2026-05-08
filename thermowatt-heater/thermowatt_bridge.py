@@ -371,7 +371,7 @@ class MyThermowattBridge:
         result = status_data.get('result', {})
         water_heater_sts    = int(result.get('WaterHeaterSts', 0))
         result['heating']   = (water_heater_sts & 1) != 0
-        result['last_polled_at'] = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S+00:00')
+        result['last_polled_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
         return status_data
 
     def poll_status(self, serial):
@@ -533,7 +533,7 @@ class MyThermowattBridge:
             # Recompute heating flag from overridden WaterHeaterSts if present
             water_heater_sts    = int(result.get('WaterHeaterSts', 0))
             result['heating']   = (water_heater_sts & 1) != 0
-            result['last_polled_at'] = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S+00:00')
+            result['last_polled_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
 
             status['result'] = result
             self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status), retain=True)
