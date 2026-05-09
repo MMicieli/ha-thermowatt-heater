@@ -5,6 +5,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Fork note:** This repository is forked from [waterheater-dev/ha-thermowatt-heater](https://github.com/waterheater-dev/ha-thermowatt-heater) at v1.3.0. Versions 1.0.0–1.3.0 reflect upstream history. Changes from v1.4.0 onwards are specific to this fork.
 
+[1.5.3] - 2026-05-09
+### Fixed
+- `Time_prog` state_class corrected from `measurement` to `total_increasing` — confirmed lifetime accumulating counter (observed delta 282 min over single day)
+
 ## [1.5.2] - 2026-05-08
 ### Fixed
 - Replace deprecated `datetime.utcnow()` with timezone-aware `datetime.now(UTC)` (Python 3.12 compatibility)
@@ -110,6 +114,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[1.5.3]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/1.3.0...v1.5.1
 [1.4.0]: https://github.com/MMicieli/ha-thermowatt-heater/compare/1.3.0...v1.5.1
