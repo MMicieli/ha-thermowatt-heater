@@ -297,7 +297,7 @@ class MyThermowattBridge:
                 "state_topic":          status_topic,
                 "value_template":       "{{ value_json.result.Time_prog | default(0) | int }}",
                 "unit_of_measurement":  "min",
-                "state_class":          "measurement",
+                "state_class":          "total_increasing",
                 "icon":                 "mdi:timer-check-outline",
                 "slug":                 "time_prog",
             },
