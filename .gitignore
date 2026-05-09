@@ -7,21 +7,25 @@ __pycache__/
 venv/
 ENV/
 
-# --- VSCode specifc ---
-.vscode
-.history
-.DS_Store
+# --- VSCode Specific ---
+.vscode/
+.history/
 
 # --- Home Assistant / Add-on Specific ---
-# Ignore any local testing secrets or keys
 secrets.yaml
 *.log
 local_test_data.json
 
+# --- Sensitive Credentials ---
+client.crt
+client.key
+root.pem
+*.pem
+*.crt
+*.key
+.env
+.flaskenv
+
 # --- OS Specific ---
 .DS_Store
 Thumbs.db
-
-# --- Sensitive Environment Files ---
-.env
-.flaskenv
