@@ -18,17 +18,19 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 
 | Entity | Type | Description |
 |---|---|---|
-| `water_heater.<name>` | Water Heater | Mode and temperature control |
-| `binary_sensor.<name>_heating` | Binary Sensor | Element active state |
-| `sensor.<name>_average_temperature` | Sensor | T_Avg — firmware average tank temp |
-| `sensor.<name>_desired_temperature` | Sensor | T_dsrd — current target setpoint |
-| `sensor.<name>_boost_ceiling` | Sensor | TBoost — maximum boost temperature |
-| `sensor.<name>_ambient_temperature` | Sensor | TAmb — installation environment temp |
-| `sensor.<name>_eco_runtime` | Sensor | Time_eco — eco mode runtime counter |
-| `sensor.<name>_programme_runtime` | Sensor | Time_prog — programme runtime counter |
-| `sensor.<name>_wifi_signal` | Sensor | Rssi — WiFi signal strength |
-| `sensor.<name>_water_heater_status_raw` | Sensor | WaterHeaterSts — raw status bitmask |
-| `sensor.<name>_last_polled` | Sensor | last_polled_at — UTC timestamp of last successful poll |
+| `water_heater.<name>_boiler_<name>` | Water Heater | Mode and temperature control |
+| `binary_sensor.<name>_<name>_heating` | Binary Sensor | Element active state |
+| `sensor.<name>_<name>_average_temperature` | Sensor | T_Avg — firmware average tank temp (more accurate than display value) |
+| `sensor.<name>_<name>_desired_temperature` | Sensor | T_dsrd — current target setpoint |
+| `sensor.<name>_<name>_boost_ceiling` | Sensor | TBoost — maximum boost temperature |
+| `sensor.<name>_<name>_ambient_temperature` | Sensor | TAmb — installation environment temp (diagnostic) |
+| `sensor.<name>_<name>_eco_runtime` | Sensor | Time_eco — eco mode runtime counter (unit/reset behaviour unconfirmed) |
+| `sensor.<name>_<name>_programme_runtime` | Sensor | Time_prog — programme runtime counter (unit/reset behaviour unconfirmed) |
+| `sensor.<name>_<name>_wifi_signal` | Sensor | Rssi — WiFi signal strength in dBm (diagnostic) |
+| `sensor.<name>_<name>_water_heater_status_raw` | Sensor | WaterHeaterSts — raw status bitmask (diagnostic) |
+| `sensor.<name>_<name>_last_polled` | Sensor | last_polled_at — UTC timestamp of last successful poll (diagnostic) |
+
+> **Note:** `<name>` is the device name set in the MyThermowatt app. For a device named `HWS`, entity IDs will be `water_heater.hws_boiler_hws`, `sensor.hws_hws_average_temperature`, etc.
 
 ## Installation
 
@@ -81,7 +83,7 @@ OK: Step 5 - Found 1 thermostats.
 🌉 Bridge active for: HWS (4032429241482944)
 OK: Step 6 - Booted successfully.
 OK: Step 7 - Starting polling loop (normal=60s, confirm=20s).
-[STATUS] Polled 5 times, got 5 x 200, 0 errors, interval=60s
+[STATUS] Polled 5 times, 5 x 200, 0 errors, interval=60s
 
 ## Known to Work On
 
