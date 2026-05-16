@@ -5,6 +5,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Fork note:** This repository is forked from [waterheater-dev/ha-thermowatt-heater](https://github.com/waterheater-dev/ha-thermowatt-heater) at v1.3.0. Versions 1.0.0–1.3.0 reflect upstream history. Changes from v1.4.0 onwards are specific to this fork.
 
+1.6.0 - 2026-05-16
+ ### Added                                                                                                                                                                                                                           
+  - Power sensor (sensor.hws_hws_power) — MQTT discovery on P/{serial}/STATUS, publishes 3000 W when heating, 0 W otherwise. device_class: power, state_class: measurement.                                                               
+  - Energy sensor (sensor.hws_hws_energy_kwh) — separate topic P/{serial}/energy_kwh. Bridge accumulates 3 kW × elapsed hours each poll cycle, persisted in config.json across restarts. state_class: total_increasing — qualifies for the
+   HA Energy Dashboard directly.                                                                                                                                                                                                          
+                                                                                                                                                                                                                                          
+  ### Fixed                                                                                                                                                                                                                           
+  - on_connect callback added — re-subscribes to all P/{serial}/CMD/# topics and re-publishes "online" on every (re)connect. Without this, MQTT reconnects silently lost all command subscriptions.                                       
+  - on_disconnect callback added for logging.                                                                                                                                                                                             
+  - Callbacks registered before connect() so they fire on the initial connection too.                                                                                                                                                     
+  - STATUS topic publishes changed to QoS=1 (was 0) in both poll_status and _inject_fake_status.                                                                                                                                       
+  - 429 handling: break → continue so remaining devices still get polled after one device hits a rate limit.                                                                                                                              
+  - threading.Lock (_config_lock) protects self.config for concurrent reads/writes between the main poll thread and the MQTT callback thread.  
+
 [1.5.3] - 2026-05-09
 ### Fixed
 - `Time_prog` state_class corrected from `measurement` to `total_increasing` — confirmed lifetime accumulating counter (observed delta 282 min over single day)
