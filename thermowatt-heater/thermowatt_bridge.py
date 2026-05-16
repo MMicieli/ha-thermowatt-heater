@@ -1,10 +1,9 @@
-import sys, json, time, uuid, os, signal, requests, urllib3, datetime
+import sys, json, time, uuid, os, signal, threading, requests, urllib3, datetime
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 
-# FIX 10: verify=False only if explicitly opted in via env var.
-# Default is proper TLS verification. Set THERMOWATT_TLS_NO_VERIFY=1 only
-# if the backend genuinely rejects certificate validation (debug fallback).
+# Proper TLS verification by default. Set THERMOWATT_TLS_NO_VERIFY=1 only if
+# the backend genuinely rejects certificate validation (debug fallback).
 TLS_VERIFY = os.getenv("THERMOWATT_TLS_NO_VERIFY", "0") != "1"
 if not TLS_VERIFY:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -22,9 +21,7 @@ MQTT_PASS    = os.getenv("MQTT_PASSWORD")
 # Bridge availability topic — used for LWT and all discovery payloads
 AVAILABILITY_TOPIC = "thermowatt/bridge/status"
 
-# v1.5.1 FIX 2: HTTP timeouts — (connect_timeout, read_timeout) in seconds.
-# Prevents hung cloud requests from freezing polling and command confirmation.
-# 5s connect is generous for a known hostname; 15s read covers slow API responses.
+# HTTP timeouts — (connect_timeout, read_timeout) in seconds.
 HTTP_TIMEOUT = (5, 15)
 
 
@@ -32,57 +29,53 @@ class MyThermowattBridge:
     API_KEY  = "YVjArWssxKH631jv1dnnWOTr6gijsSAGz7rQJ4hJoUNRffxYvbQaMbePBEZalena"
     BASE_URL = "https://myapp-connectivity.com/api/v1"
 
-    # FIX 7: Normal polling 60s — reduces cloud rate-limit risk and produces
-    # cleaner InfluxDB calibration data (T_Avg changes ~0.14°C/interval at 60s
-    # which is above thermistor noise; 20s produces noise-dominated readings).
-    # Post-command confirmation window drops to 20s for 60s then resumes normal.
+    # Normal polling 60s — reduces cloud rate-limit risk and produces cleaner
+    # InfluxDB calibration data. Post-command confirmation window uses 20s.
     POLL_INTERVAL         = 60   # seconds — normal operation
     POLL_INTERVAL_CONFIRM = 20   # seconds — post-command confirmation window
     CONFIRM_WINDOW        = 60   # seconds — how long to stay in fast-poll after a command
     STATUS_LOG_INTERVAL   = 300  # seconds — 5-minute summary log
 
-    # FIX 2 / Safety: firmware-confirmed ceiling from T_set_max attribute.
-    # Hardware mechanical cutout at ~90°C is independent of this.
-    # EMS boost ceiling is 70°C — do not raise without re-verifying firmware.
+    # Firmware-confirmed temperature ceiling from T_set_max attribute.
+    # Hardware mechanical cutout at ~90°C is independent.
     TEMP_MIN = 20
     TEMP_MAX = 70  # matches confirmed T_set_max: 70 from device attributes
 
-    # v1.5.1 FIX 4: CMD_COOLDOWN reduced 60s → 15s.
-    # 60s blocked the paired set_temperature + set_operation_mode sequence that
-    # ems_v5_2_hws_follow_emhass_deferrable0 sends in a single automation action.
-    # 15s is sufficient anti-spam protection for a resistive element.
-    # Strategic dwell time (minimum 20–30 min between EMS decisions) is enforced
-    # at the HA/EMHASS layer, not the bridge.
+    # CMD_COOLDOWN 15s — sufficient anti-spam for a resistive element.
+    # Strategic dwell time (20–30 min between EMS decisions) is enforced at HA/EMHASS layer.
     CMD_COOLDOWN = 15  # seconds
 
     def __init__(self):
         self.config = self._load_config()
+        self._config_lock = threading.Lock()
+
         # Single session instance — preserves cookies from AWS load balancers
         self.session = requests.Session()
 
-        # FIX 5 (LWT): set Last Will before connect so broker publishes
-        # "offline" automatically if bridge disconnects uncleanly.
         self.mqtt_client = mqtt.Client(CallbackAPIVersion.VERSION2)
         self.mqtt_client.will_set(AVAILABILITY_TOPIC, "offline", retain=True)
         if MQTT_USER:
             self.mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
         # Polling state
-        self.poll_count           = 0
-        self.success_count        = 0
-        self.error_count          = 0
-        self.last_status_log_time = time.time()
-        self.rate_limit_backoff   = 0  # 0=none, 1+=backoff steps
+        self.poll_count            = 0
+        self.success_count         = 0
+        self.error_count           = 0
+        self.last_status_log_time  = time.time()
+        self.rate_limit_backoff    = 0  # 0=none, 1+=backoff steps
         self.current_poll_interval = self.POLL_INTERVAL
 
-        # FIX 7: post-command fast-poll window tracking
+        # Post-command fast-poll window tracking
         self._confirm_until: float = 0.0  # epoch time until which fast-poll is active
 
-        # Per-device status cache — used by _inject_fake_status (FIX 3)
+        # Per-device status cache — used by _inject_fake_status
         self._last_status: dict = {}  # {serial: {result: {...}}}
 
-        # Per-device command cooldown tracking (FIX 4)
+        # Per-device command cooldown tracking
         self._last_cmd_time: dict = {}  # {serial: epoch float}
+
+        # Per-device last successful poll timestamp — for energy accumulation
+        self._last_poll_ts: dict = {}  # {serial: epoch float}
 
     # ------------------------------------------------------------------ #
     #  Config helpers                                                      #
@@ -164,6 +157,28 @@ class MyThermowattBridge:
         return resp
 
     # ------------------------------------------------------------------ #
+    #  MQTT callbacks                                                      #
+    # ------------------------------------------------------------------ #
+
+    def on_connect(self, client, userdata, connect_flags, reason_code, properties):
+        """Re-publishes availability and re-subscribes CMD topics on every (re)connect.
+        Fires in the paho background thread, not the main polling thread.
+        """
+        if reason_code == 0:
+            client.publish(AVAILABILITY_TOPIC, "online", retain=True)
+            with self._config_lock:
+                device_serials = list(self.config.get('devices', {}).keys())
+            for serial in device_serials:
+                client.subscribe(f"P/{serial}/CMD/#")
+                print(f"[MQTT] (Re)subscribed to P/{serial}/CMD/#")
+            print("[MQTT] Connected — subscriptions restored, availability published online.")
+        else:
+            print(f"[MQTT] Connection failed: reason_code={reason_code}")
+
+    def on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        print(f"[MQTT] Disconnected: reason_code={reason_code}. Paho will auto-reconnect.")
+
+    # ------------------------------------------------------------------ #
     #  MQTT discovery                                                      #
     # ------------------------------------------------------------------ #
 
@@ -172,9 +187,9 @@ class MyThermowattBridge:
 
     def _availability_block(self):
         return {
-            "availability_topic":       AVAILABILITY_TOPIC,
-            "payload_available":        "online",
-            "payload_not_available":    "offline",
+            "availability_topic":    AVAILABILITY_TOPIC,
+            "payload_available":     "online",
+            "payload_not_available": "offline",
         }
 
     def publish_discovery(self, serial, name):
@@ -183,11 +198,6 @@ class MyThermowattBridge:
         status_topic = f"P/{serial}/STATUS"
 
         # ── Water Heater entity ─────────────────────────────────────────
-        # FIX 1: max_temp corrected to 70 — matches firmware T_set_max: 70.
-        #        Advertising 75 caused HA to allow commands the firmware silently rejects.
-        # FIX 6: removed explicit optimistic:True — HA derives optimistic=False
-        #        automatically when mode_state_topic is present, giving confirmed state.
-        # FIX 5: availability_topic added so entity shows unavailable when bridge dies.
         wh_payload = {
             "unique_id":                    f"thermowatt_{serial}_v314",
             "name":                         f"Boiler {name}",
@@ -200,7 +210,6 @@ class MyThermowattBridge:
             "temperature_state_template":   "{{ value_json.result.T_SetPoint | default(0) | float }}",
             "temperature_command_topic":    f"P/{serial}/CMD/TEMP",
             "mode_state_topic":             status_topic,
-            # FIX 2 (carried forward): all branches match modes list exactly
             "mode_state_template": (
                 "{% set cmd = value_json.result.Cmd | default(0) | int %}"
                 "{% if cmd == 9 %}Manual"
@@ -223,18 +232,16 @@ class MyThermowattBridge:
         )
 
         # ── Binary sensor: Heating active ───────────────────────────────
-        # FIX 1 (carried forward): pre-computed heating bool with | lower
-        # FIX 5: availability added
         heating_payload = {
-            "unique_id":        f"thermowatt_{serial}_heating",
-            "name":             f"{name} Heating",
-            "state_topic":      status_topic,
-            "value_template":   "{{ value_json.result.heating | default(false) | lower }}",
-            "payload_on":       "true",
-            "payload_off":      "false",
-            "device_class":     "heat",
-            "icon":             "mdi:fire",
-            "device":           device,
+            "unique_id":      f"thermowatt_{serial}_heating",
+            "name":           f"{name} Heating",
+            "state_topic":    status_topic,
+            "value_template": "{{ value_json.result.heating | default(false) | lower }}",
+            "payload_on":     "true",
+            "payload_off":    "false",
+            "device_class":   "heat",
+            "icon":           "mdi:fire",
+            "device":         device,
             **avail,
         }
         self.mqtt_client.publish(
@@ -242,11 +249,50 @@ class MyThermowattBridge:
             json.dumps(heating_payload), retain=True
         )
 
+        # ── Power sensor — real-time draw derived from heating state ────
+        # 3000 W when heating, 0 W otherwise. Published on STATUS topic.
+        # HA entity: sensor.{device_slug}_{name_slug}_power
+        # (e.g. sensor.hws_hws_power for device "HWS", name "HWS Power")
+        power_payload = {
+            "unique_id":            f"thermowatt_{serial}_power_w",
+            "name":                 f"{name} Power",
+            "state_topic":          status_topic,
+            "value_template":       "{{ 3000 if value_json.result.heating else 0 }}",
+            "unit_of_measurement":  "W",
+            "device_class":         "power",
+            "state_class":          "measurement",
+            "icon":                 "mdi:lightning-bolt",
+            "device":               device,
+            **avail,
+        }
+        self.mqtt_client.publish(
+            f"homeassistant/sensor/{serial}/power/config",
+            json.dumps(power_payload), retain=True
+        )
+
+        # ── Energy sensor — accumulated kWh (bridge-side integration) ──
+        # Persisted in config.json — survives bridge restarts.
+        # Published on a dedicated topic; value is a plain float string.
+        # state_class: total_increasing qualifies for HA Energy Dashboard.
+        energy_payload = {
+            "unique_id":            f"thermowatt_{serial}_energy_kwh",
+            "name":                 f"{name} Energy kWh",
+            "state_topic":          f"P/{serial}/energy_kwh",
+            "value_template":       "{{ value | float(0) }}",
+            "unit_of_measurement":  "kWh",
+            "device_class":         "energy",
+            "state_class":          "total_increasing",
+            "icon":                 "mdi:lightning-bolt-circle",
+            "device":               device,
+            **avail,
+        }
+        self.mqtt_client.publish(
+            f"homeassistant/sensor/{serial}/energy_kwh/config",
+            json.dumps(energy_payload), retain=True
+        )
+
         # ── Individual sensors for EMS-critical fields ──────────────────
-        # FIX 8: Time_eco / Time_prog changed to state_class: measurement
-        #        until confirmed as lifetime-increasing counters.
-        # FIX 9: last_polled value_template returns none (not 'unknown') on
-        #        missing field so HA timestamp device_class does not error.
+        # Time_eco / Time_prog: state_class measurement until semantics confirmed.
         sensors = [
             {
                 "unique_id":            f"thermowatt_{serial}_t_avg",
@@ -317,8 +363,8 @@ class MyThermowattBridge:
                 "unique_id":        f"thermowatt_{serial}_last_polled",
                 "name":             f"{name} Last Polled",
                 "state_topic":      status_topic,
-                # FIX 9: return none (null) not string 'unknown' — HA timestamp
-                # device_class requires a valid ISO8601 value or none, not a string.
+                # Return none (null) not string 'unknown' — HA timestamp device_class
+                # requires a valid ISO8601 value or none, not a bare string.
                 "value_template":   (
                     "{% if value_json.result.last_polled_at is defined %}"
                     "{{ value_json.result.last_polled_at }}"
@@ -384,7 +430,25 @@ class MyThermowattBridge:
                 status_data = r.json()
                 status_data = self._compute_status(status_data)
                 self._last_status[serial] = status_data
-                self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status_data), retain=True)
+                # QoS=1 — at-least-once delivery ensures HA always receives status updates.
+                self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status_data), qos=1, retain=True)
+
+                # Energy accumulation — integrates 3 kW × elapsed_hours when heating.
+                # Persisted in config.json so the counter survives bridge restarts.
+                now = time.time()
+                if serial in self._last_poll_ts:
+                    elapsed_h = (now - self._last_poll_ts[serial]) / 3600.0
+                    if status_data.get('result', {}).get('heating'):
+                        with self._config_lock:
+                            bucket = self.config.setdefault('energy_kwh', {})
+                            bucket[serial] = round(bucket.get(serial, 0.0) + 3.0 * elapsed_h, 4)
+                            self._save_config()
+                self._last_poll_ts[serial] = now
+
+                with self._config_lock:
+                    kwh = self.config.get('energy_kwh', {}).get(serial, 0.0)
+                self.mqtt_client.publish(f"P/{serial}/energy_kwh", kwh, qos=1, retain=True)
+
                 return (True, status_code)
             else:
                 return (False, status_code)
@@ -398,9 +462,9 @@ class MyThermowattBridge:
 
     def _check_cooldown(self, serial) -> bool:
         """Returns True if enough time has passed since the last command.
-        FIX 4: prevents rapid element cycling which stresses the heating element.
+        Prevents rapid element cycling which stresses the heating element.
         """
-        last = self._last_cmd_time.get(serial, 0)
+        last    = self._last_cmd_time.get(serial, 0)
         elapsed = time.time() - last
         if elapsed < self.CMD_COOLDOWN:
             remaining = int(self.CMD_COOLDOWN - elapsed)
@@ -409,21 +473,17 @@ class MyThermowattBridge:
         return True
 
     def _record_command(self, serial):
-        """Record command timestamp and enter fast-poll confirmation window.
-        FIX 7: fast-poll window gives HA confirmed state feedback within 20s.
-        """
+        """Record command timestamp and enter fast-poll confirmation window."""
         self._last_cmd_time[serial] = time.time()
-        self._confirm_until = time.time() + self.CONFIRM_WINDOW
-        self.current_poll_interval = self.POLL_INTERVAL_CONFIRM
+        self._confirm_until         = time.time() + self.CONFIRM_WINDOW
+        self.current_poll_interval  = self.POLL_INTERVAL_CONFIRM
         print(f"[CMD] Confirmation window active — polling at {self.POLL_INTERVAL_CONFIRM}s for {self.CONFIRM_WINDOW}s")
 
     def on_mqtt_message(self, client, userdata, msg):
         """Local HA → REST API command handler."""
         try:
-            # v1.5.1 FIX 1: Ignore retained commands.
-            # MQTT brokers replay the last retained message to new subscribers on connect.
-            # A retained CMD topic could execute a stale mode/temperature command on
-            # bridge restart. Command topics must never be acted on from retained state.
+            # Ignore retained commands — a retained CMD topic replayed on (re)connect
+            # could execute a stale mode/temperature command.
             if getattr(msg, "retain", False):
                 print(f"[CMD] Ignoring retained command on {msg.topic}")
                 return
@@ -434,32 +494,31 @@ class MyThermowattBridge:
                 return
             sn = parts[1]
 
-            device_config = self.config.get('devices', {}).get(sn, {})
+            with self._config_lock:
+                device_config = dict(self.config.get('devices', {}).get(sn, {}))
             if not device_config:
                 print(f"⚠️  Unknown device serial: {sn}")
                 return
 
-            # FIX 4: enforce cooldown before any command
             if not self._check_cooldown(sn):
                 return
 
             current_fav = device_config.get("last_setpoint", 60)
 
             if f"P/{sn}/CMD/TEMP" in msg.topic:
-                # FIX 2 (safety): clamp to firmware-confirmed safe range before sending.
-                # Firmware T_set_max: 70 — values above 70 are silently rejected by
-                # the device. Mechanical cutout at ~90°C is independent hardware safety.
+                # Clamp to firmware-confirmed safe range before sending.
+                # Values above 70 are silently rejected by the device.
                 raw_temp = int(float(payload))
-                temp = max(self.TEMP_MIN, min(self.TEMP_MAX, raw_temp))
+                temp     = max(self.TEMP_MIN, min(self.TEMP_MAX, raw_temp))
                 if temp != raw_temp:
-                    print(f"[CMD] Temperature {raw_temp}°C clamped to {temp}°C (firmware safe range {self.TEMP_MIN}–{self.TEMP_MAX}°C)")
+                    print(f"[CMD] Temperature {raw_temp}°C clamped to {temp}°C (firmware range {self.TEMP_MIN}–{self.TEMP_MAX}°C)")
                 print(f"[CMD] Setting Temperature to {temp}°C for {sn}...")
 
-                # FIX 3: only inject fake status if API call succeeds (2xx)
                 resp = self.request("POST", "/manual", serial=sn, json={"T_SetPoint": temp})
                 if resp is not None and 200 <= resp.status_code < 300:
-                    device_config["last_setpoint"] = temp
-                    self.config['devices'][sn]     = device_config
+                    with self._config_lock:
+                        self.config['devices'][sn]["last_setpoint"] = temp
+                        self._save_config()
                     self._inject_fake_status(sn, {"T_SetPoint": str(temp)})
                     self._record_command(sn)
                 else:
@@ -469,7 +528,6 @@ class MyThermowattBridge:
             elif f"P/{sn}/CMD/MODE" in msg.topic:
                 print(f"[CMD] Setting Mode to {payload} for {sn}...")
 
-                # FIX 3: check response before injecting fake status on every branch
                 if payload == "Manual":
                     resp = self.request("POST", "/manual", serial=sn, json={"T_SetPoint": current_fav})
                     if resp is not None and 200 <= resp.status_code < 300:
@@ -514,14 +572,12 @@ class MyThermowattBridge:
                     else:
                         print(f"[ERROR] Off command failed ({resp.status_code if resp else 'no response'})")
 
-            self._save_config()
         except Exception as e:
             print(f"MQTT Cmd Error: {e}")
 
     def _inject_fake_status(self, serial, overrides):
         """Immediately updates HA state to prevent flipping while cloud syncs.
-        Only called after a confirmed 2xx API response (FIX 3).
-        Uses cached last known status instead of a live GET (FIX 3 carried forward).
+        Only called after a confirmed 2xx API response.
         """
         try:
             status = json.loads(json.dumps(self._last_status.get(serial, {"result": {}})))
@@ -531,12 +587,13 @@ class MyThermowattBridge:
                 result[k] = str(v)
 
             # Recompute heating flag from overridden WaterHeaterSts if present
-            water_heater_sts    = int(result.get('WaterHeaterSts', 0))
-            result['heating']   = (water_heater_sts & 1) != 0
+            water_heater_sts  = int(result.get('WaterHeaterSts', 0))
+            result['heating'] = (water_heater_sts & 1) != 0
             result['last_polled_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
 
             status['result'] = result
-            self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status), retain=True)
+            # QoS=1 matches poll_status — ensures HA receives the fake-state update.
+            self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status), qos=1, retain=True)
         except Exception as e:
             print(f"⚠️  Status injection failed for {serial}: {e}")
 
@@ -552,9 +609,9 @@ class MyThermowattBridge:
                 f"{self.success_count} x 200, {self.error_count} errors, "
                 f"interval={self.current_poll_interval}s"
             )
-            self.poll_count    = 0
-            self.success_count = 0
-            self.error_count   = 0
+            self.poll_count           = 0
+            self.success_count        = 0
+            self.error_count          = 0
             self.last_status_log_time = time.time()
 
     # ------------------------------------------------------------------ #
@@ -570,19 +627,20 @@ class MyThermowattBridge:
         print("OK: Step 1 - Credentials present.")
 
         try:
+            # Register callbacks BEFORE connect so on_connect fires on initial connection.
+            self.mqtt_client.on_connect    = self.on_connect
+            self.mqtt_client.on_disconnect = self.on_disconnect
             self.mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
-            # FIX 5: publish online after successful connect
-            self.mqtt_client.publish(AVAILABILITY_TOPIC, "online", retain=True)
-            print("OK: Step 2 & 3 - Connected to MQTT. Availability: online.")
+            print("OK: Step 2 - MQTT TCP connection initiated.")
         except Exception as e:
-            print(f"FAILED: Step 2/3 - MQTT Connection Error: {e}")
+            print(f"FAILED: Step 2 - MQTT Connection Error: {e}")
             sys.exit(1)
 
         try:
             self.login()
-            print("OK: Step 4 - Logged in to Thermowatt backend.")
+            print("OK: Step 3 - Logged in to Thermowatt backend.")
         except Exception as e:
-            print(f"FAILED: Step 4 - Backend authentication failed: {e}")
+            print(f"FAILED: Step 3 - Backend authentication failed: {e}")
             sys.exit(1)
 
         try:
@@ -591,69 +649,69 @@ class MyThermowattBridge:
             if not devices:
                 raise Exception("Zero devices returned")
 
-            if 'devices' not in self.config:
-                self.config['devices'] = {}
-
-            print(f"OK: Step 5 - Found {len(devices)} thermostats.")
+            print(f"OK: Step 4 - Found {len(devices)} thermostats.")
 
             for dev in devices:
                 serial = dev['seriale']
                 name   = dev.get('nome', 'Boiler')
 
-                if serial not in self.config['devices']:
-                    self.config['devices'][serial] = {"name": name, "last_setpoint": 60}
-                else:
-                    self.config['devices'][serial]["name"] = name
+                with self._config_lock:
+                    if serial not in self.config['devices']:
+                        self.config['devices'][serial] = {"name": name, "last_setpoint": 60}
+                    else:
+                        self.config['devices'][serial]["name"] = name
+                    self._save_config()
 
                 self.publish_discovery(serial, name)
-                self.mqtt_client.subscribe(f"P/{serial}/CMD/#")
                 print(f"🌉 Bridge active for: {name} ({serial})")
 
-            self._save_config()
-
         except Exception as e:
-            print(f"FAILED: Step 5 - Could not retrieve thermostat list: {e}")
+            print(f"FAILED: Step 4 - Could not retrieve thermostat list: {e}")
             sys.exit(1)
 
-        print("OK: Step 6 - Booted successfully.")
+        print("OK: Step 5 - Device discovery published.")
 
         self.mqtt_client.on_message = self.on_mqtt_message
         self.mqtt_client.loop_start()
 
-        print(f"OK: Step 7 - Starting polling loop (normal={self.POLL_INTERVAL}s, confirm={self.POLL_INTERVAL_CONFIRM}s).")
+        print(f"OK: Step 6 - Polling loop starting (normal={self.POLL_INTERVAL}s, confirm={self.POLL_INTERVAL_CONFIRM}s).")
 
         while True:
             try:
-                # FIX 7: exit fast-poll window once confirm period has elapsed
+                # Exit fast-poll window once confirm period has elapsed
                 if self.current_poll_interval == self.POLL_INTERVAL_CONFIRM:
                     if time.time() >= self._confirm_until:
                         self.current_poll_interval = self.POLL_INTERVAL
                         print(f"[POLL] Confirmation window closed — resuming normal polling ({self.POLL_INTERVAL}s)")
 
-                for serial in self.config.get('devices', {}).keys():
+                with self._config_lock:
+                    device_serials = list(self.config.get('devices', {}).keys())
+
+                for serial in device_serials:
                     self.poll_count += 1
                     success, status_code = self.poll_status(serial)
 
                     if success:
                         self.success_count += 1
                         if self.rate_limit_backoff > 0:
-                            self.rate_limit_backoff    = 0
-                            # Restore normal or confirm interval, not hardcoded 20s
-                            if time.time() < self._confirm_until:
-                                self.current_poll_interval = self.POLL_INTERVAL_CONFIRM
-                            else:
-                                self.current_poll_interval = self.POLL_INTERVAL
+                            self.rate_limit_backoff = 0
+                            self.current_poll_interval = (
+                                self.POLL_INTERVAL_CONFIRM
+                                if time.time() < self._confirm_until
+                                else self.POLL_INTERVAL
+                            )
                     else:
                         self.error_count += 1
                         if status_code == 429:
                             self.rate_limit_backoff += 1
-                            # Backoff: 60s → 120s → 180s (already at 60s normal, so steps above it)
                             backoff_interval = min(60 * (self.rate_limit_backoff + 1), 180)
                             self.current_poll_interval = backoff_interval
-                            print(f"[RATE LIMIT] 429 received, backing off to {self.current_poll_interval}s")
-                            break
+                            print(f"[RATE LIMIT] 429 from {serial}, backing off to {self.current_poll_interval}s")
+                            # continue — don't skip remaining devices; each has its own serial.
+                            # The backoff sleep below applies to the whole next iteration.
+                            continue
                         elif status_code is not None:
-                            print(f"[ERROR] Got status {status_code}, re-logging in...")
+                            print(f"[ERROR] Got status {status_code} for {serial}, re-logging in...")
                             try:
                                 self.login()
                             except Exception as e:
@@ -673,18 +731,15 @@ class MyThermowattBridge:
                     print(f"[ERROR] Re-login failed: {e2}")
                 time.sleep(self.current_poll_interval)
 
-        # v1.5.1 FIX 3: Explicitly publish offline on clean shutdown.
-        # MQTT LWT fires on unclean disconnect only. A clean add-on stop/restart
-        # leaves entities showing available without this explicit publish.
+        # Explicitly publish offline on clean shutdown.
+        # LWT fires on unclean disconnect only; this covers clean add-on stop/restart.
         self.mqtt_client.publish(AVAILABILITY_TOPIC, "offline", retain=True)
         time.sleep(0.2)  # allow publish to flush before disconnect
         self.mqtt_client.disconnect()
 
 
 def _sigterm_handler(signum, frame):
-    """SIGTERM handler — HA add-on supervisor sends SIGTERM on stop.
-    Raises KeyboardInterrupt so the main loop's clean shutdown path executes.
-    """
+    """SIGTERM handler — HA add-on supervisor sends SIGTERM on stop."""
     raise KeyboardInterrupt
 
 
