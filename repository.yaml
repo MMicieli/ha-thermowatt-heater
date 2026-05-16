@@ -1,3 +1,3 @@
-name: "Thermowatt Smart Boiler (MMicieli Fork)"
-url: "https://github.com/waterheater-dev/ha-thermowatt-heater"
-maintainer: "Waterheater Dev <thermohacker@proton.me>"
+name: "Thermowatt Smart Boiler"
+url: "https://github.com/MMicieli/ha-thermowatt-heater"
+maintainer: "MMicieli"

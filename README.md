@@ -12,6 +12,7 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 - **EMS-ready Sensors**: Dedicated first-class entities for `T_Avg`, `T_dsrd`, `TBoost`, `TAmb`, `Time_eco`, `Time_prog`, `Rssi`, `WaterHeaterSts`, and `last_polled_at` — directly loggable to InfluxDB
 - **Availability Tracking**: MQTT LWT publishes `offline` when bridge stops; all entities show unavailable in HA
 - **Stale Data Protection**: `last_polled_at` timestamp enables HA-side stale detection
+- **Power & Energy Monitoring**: Real-time 3 kW draw sensor + accumulated kWh counter (persisted across restarts). Both qualify for the HA Energy Dashboard
 - **Safety Hardening**: Server-side temperature clamp (20–70°C), retained command rejection, HTTP timeouts, clean shutdown
 
 ## Entities Created
@@ -29,6 +30,8 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 | `sensor.<name>_<name>_wifi_signal` | Sensor | Rssi — WiFi signal strength in dBm (diagnostic) |
 | `sensor.<name>_<name>_water_heater_status_raw` | Sensor | WaterHeaterSts — raw status bitmask (diagnostic) |
 | `sensor.<name>_<name>_last_polled` | Sensor | last_polled_at — UTC timestamp of last successful poll (diagnostic) |
+| `sensor.<name>_<name>_power` | Sensor | Real-time power draw — 3000 W when heating, 0 W otherwise. Qualifies for HA Energy Dashboard |
+| `sensor.<name>_<name>_energy_kwh` | Sensor | Accumulated energy (kWh) — bridge-side integration, persisted across restarts. `state_class: total_increasing` |
 
 > **Note:** `<name>` is the device name set in the MyThermowatt app. For a device named `HWS`, entity IDs will be `water_heater.hws_boiler_hws`, `sensor.hws_hws_average_temperature`, etc.
 
@@ -75,15 +78,19 @@ password: "your-password"
 - SIGTERM from HA Supervisor triggers clean shutdown path
 
 ## Healthy Boot Log
+
+```
 --- BOOT SEQUENCE START ---
 OK: Step 1 - Credentials present.
-OK: Step 2 & 3 - Connected to MQTT. Availability: online.
-OK: Step 4 - Logged in to Thermowatt backend.
-OK: Step 5 - Found 1 thermostats.
+OK: Step 2 - MQTT TCP connection initiated.
+OK: Step 3 - Logged in to Thermowatt backend.
+OK: Step 4 - Found 1 thermostats.
 🌉 Bridge active for: HWS (4032429241482944)
-OK: Step 6 - Booted successfully.
-OK: Step 7 - Starting polling loop (normal=60s, confirm=20s).
+OK: Step 5 - Device discovery published.
+[MQTT] Connected — subscriptions restored, availability published online.
+OK: Step 6 - Polling loop starting (normal=60s, confirm=20s).
 [STATUS] Polled 5 times, 5 x 200, 0 errors, interval=60s
+```
 
 ## Known to Work On
 
@@ -98,10 +105,3 @@ _Tip: Help others by adding your version here if it works._
 
 _Disclaimer: This project is not affiliated with or endorsed by Thermowatt or Ariston._
 
----
-
-### Support the original author
-
-If this add-on saved you some frustration, feel free to [buy waterheater-dev a beer on Ko-fi!](https://ko-fi.com/thermohacker)
-
-[![support](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/thermohacker)
