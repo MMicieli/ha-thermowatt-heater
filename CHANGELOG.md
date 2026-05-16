@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ##[1.6.1] - 2026-05-16
  ### Added            
-+- `_inject_fake_status` heating flag no longer incorrectly re-applies the stale cached `WaterHeaterSts` value for mode-only commands. Previously, the bitmask recomputation always ran regardless of whether `WaterHeate
+ - `_inject_fake_status` heating flag no longer incorrectly re-applies the stale cached `WaterHeaterSts` value for mode-only commands. Previously, the bitmask recomputation always ran regardless of whether `WaterHeate
           +rSts` was in the overrides — meaning mode changes (Eco, Auto, Manual, Holiday, Off) left `heating` reflecting the pre-command poll value for up to 20 seconds.                                                          
-       11 +- Off command now explicitly passes `heating=False` so `sensor.hws_hws_power` and `binary_sensor.hws_heating` immediately show 0 W / off after a successful Off command.   
+ - Off command now explicitly passes `heating=False` so `sensor.hws_hws_power` and `binary_sensor.hws_heating` immediately show 0 W / off after a successful Off command.   
 
 ##[1.6.0] - 2026-05-16
  ### Added                                                                                                                                                                                                                           
