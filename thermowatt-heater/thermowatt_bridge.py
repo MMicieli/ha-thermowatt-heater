@@ -566,7 +566,7 @@ class MyThermowattBridge:
                     print(f"[CMD] Turning Boiler OFF for {sn}...")
                     resp = self.request("POST", "/off", serial=sn, headers={"Content-Type": "text/plain"}, data="")
                     if resp is not None and 200 <= resp.status_code < 300:
-                        self._inject_fake_status(sn, {"Cmd": "16"})
+                        self._inject_fake_status(sn, {"Cmd": "16"}, heating=False)
                         self._record_command(sn)
                         print(f"[SUCCESS] Boiler {sn} is now OFF")
                     else:
@@ -575,9 +575,13 @@ class MyThermowattBridge:
         except Exception as e:
             print(f"MQTT Cmd Error: {e}")
 
-    def _inject_fake_status(self, serial, overrides):
+    def _inject_fake_status(self, serial, overrides, heating=None):
         """Immediately updates HA state to prevent flipping while cloud syncs.
         Only called after a confirmed 2xx API response.
+
+        heating: pass False/True to explicitly override the heating flag for mode
+        commands (e.g. Off). If None and WaterHeaterSts is not in overrides, the
+        last-polled heating value is preserved unchanged.
         """
         try:
             status = json.loads(json.dumps(self._last_status.get(serial, {"result": {}})))
@@ -586,9 +590,16 @@ class MyThermowattBridge:
             for k, v in overrides.items():
                 result[k] = str(v)
 
-            # Recompute heating flag from overridden WaterHeaterSts if present
-            water_heater_sts  = int(result.get('WaterHeaterSts', 0))
-            result['heating'] = (water_heater_sts & 1) != 0
+            # Only recompute heating from WaterHeaterSts when it is explicitly
+            # overridden — otherwise the stale cached value would be re-applied,
+            # hiding mode changes (e.g. Off) until the next real poll.
+            if 'WaterHeaterSts' in overrides:
+                water_heater_sts  = int(result.get('WaterHeaterSts', 0))
+                result['heating'] = (water_heater_sts & 1) != 0
+            elif heating is not None:
+                result['heating'] = heating
+            # else: keep the heating value from _last_status unchanged
+
             result['last_polled_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
 
             status['result'] = result
