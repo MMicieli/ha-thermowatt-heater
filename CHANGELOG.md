@@ -5,6 +5,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Fork note:** This repository is forked from [waterheater-dev/ha-thermowatt-heater](https://github.com/waterheater-dev/ha-thermowatt-heater) at v1.3.0. Versions 1.0.0–1.3.0 reflect upstream history. Changes from v1.4.0 onwards are specific to this fork.
 
+## [1.6.2] - 2026-06-21
+### Fixed
+- **Thread-safety of the shared `requests.Session`** — `login()`, `refresh_session()`, and `request()` now run under a re-entrant `_http_lock`. The session is not thread-safe and was mutated (`_reset_headers()`, `seriale`/`x-api-key`/`Authorization`) from both the main poll thread and the paho MQTT callback thread, which could clear/overwrite headers mid-flight and cause spurious 401s or a misrouted `seriale` on multi-device installs.
+- **`_update_auth` now writes config under `_config_lock`** — token refresh (reachable from the MQTT callback thread via a 401) previously wrote `config.json` without the lock the poll thread uses, so two threads could `json.dump()` the same dict concurrently and corrupt the file or drop the persisted energy counter.
+- **Energy integration step is now capped at 2× the poll interval** — `_last_poll_ts` only advances on a successful poll, so after a poll outage (429 backoff, cloud/network downtime) the next good poll could attribute the entire gap to heating and inject a large jump into the `total_increasing` energy sensor.
+
+### Changed
+- Pinned Python dependencies in the Dockerfile (`paho-mqtt>=2.1,<3`, `requests>=2.31,<3`, `urllib3>=2,<3`) for reproducible builds. `paho-mqtt>=2` is required for `CallbackAPIVersion.VERSION2`.
+
+---
+
 ## [1.6.1] - 2026-05-16
 ### Fixed
 - `_inject_fake_status` heating flag no longer incorrectly re-applies the stale cached `WaterHeaterSts` value for mode-only commands. Previously, the bitmask recomputation always ran regardless of whether `WaterHeaterSts` was in the overrides — meaning mode changes (Eco, Auto, Manual, Holiday, Off) left `heating` reflecting the pre-command poll value for up to 20 seconds.
@@ -140,6 +151,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for temperature and mode control
 
 ---
+[1.6.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.5.3...v1.6.0
 [1.5.3]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.5.2...v1.5.3
