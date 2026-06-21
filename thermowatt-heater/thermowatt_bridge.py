@@ -49,6 +49,13 @@ class MyThermowattBridge:
         self.config = self._load_config()
         self._config_lock = threading.Lock()
 
+        # Serialises all HTTP via the shared requests.Session, which is NOT
+        # thread-safe. login()/refresh_session()/request() are reachable from
+        # both the main poll thread and the paho MQTT callback thread; without
+        # this lock, concurrent _reset_headers()/seriale mutations corrupt each
+        # other's headers. Re-entrant because request() → refresh_session().
+        self._http_lock = threading.RLock()
+
         # Single session instance — preserves cookies from AWS load balancers
         self.session = requests.Session()
 
@@ -117,44 +124,54 @@ class MyThermowattBridge:
         })
 
     def _update_auth(self, access, refresh):
-        self.config.update({"access_token": access, "refresh_token": refresh})
+        # Hold the same lock the poll thread uses for config writes. This path is
+        # reachable from the MQTT callback thread (command → 401 → refresh_session)
+        # concurrently with the main poll thread's energy_kwh write; without the
+        # lock, two threads json.dump() the same dict and can corrupt the file or
+        # drop the persisted energy counter. (Caller already holds _http_lock; the
+        # _http_lock → _config_lock order is consistent everywhere, so no deadlock.)
+        with self._config_lock:
+            self.config.update({"access_token": access, "refresh_token": refresh})
+            self._save_config()
         self.session.headers["Authorization"] = f"Bearer {access}"
-        self._save_config()
 
     def login(self):
-        self._reset_headers()
-        self.session.headers["x-api-key"] = self.API_KEY
-        payload = {"username": EMAIL, "password": PASSWORD, "device_id": self.config["device_uuid"]}
-        r = self.session.post(f"{self.BASE_URL}/login", json=payload, verify=TLS_VERIFY, timeout=HTTP_TIMEOUT)
-        r.raise_for_status()
-        res = r.json()['result']
-        self._update_auth(res['accessToken'], res['refreshToken'])
-
-    def refresh_session(self):
-        self._reset_headers()
-        self.session.headers["x-api-key"] = self.API_KEY
-        payload = {"username": EMAIL, "refreshToken": self.config["refresh_token"]}
-        r = self.session.post(f"{self.BASE_URL}/refresh", json=payload, verify=TLS_VERIFY, timeout=HTTP_TIMEOUT)
-        if r.status_code == 200:
+        with self._http_lock:
+            self._reset_headers()
+            self.session.headers["x-api-key"] = self.API_KEY
+            payload = {"username": EMAIL, "password": PASSWORD, "device_id": self.config["device_uuid"]}
+            r = self.session.post(f"{self.BASE_URL}/login", json=payload, verify=TLS_VERIFY, timeout=HTTP_TIMEOUT)
+            r.raise_for_status()
             res = r.json()['result']
             self._update_auth(res['accessToken'], res['refreshToken'])
-            return True
-        return False
+
+    def refresh_session(self):
+        with self._http_lock:
+            self._reset_headers()
+            self.session.headers["x-api-key"] = self.API_KEY
+            payload = {"username": EMAIL, "refreshToken": self.config["refresh_token"]}
+            r = self.session.post(f"{self.BASE_URL}/refresh", json=payload, verify=TLS_VERIFY, timeout=HTTP_TIMEOUT)
+            if r.status_code == 200:
+                res = r.json()['result']
+                self._update_auth(res['accessToken'], res['refreshToken'])
+                return True
+            return False
 
     def request(self, method, endpoint, serial=None, **kwargs):
-        self._reset_headers()
-        url = f"{self.BASE_URL}{endpoint}"
-        if serial:
-            self.session.headers["seriale"] = serial
-        kwargs.setdefault("timeout", HTTP_TIMEOUT)
-        resp = self.session.request(method, url, verify=TLS_VERIFY, **kwargs)
-        if resp.status_code == 401:
-            if self.refresh_session():
-                self._reset_headers()
-                if serial:
-                    self.session.headers["seriale"] = serial
-                resp = self.session.request(method, url, verify=TLS_VERIFY, **kwargs)
-        return resp
+        with self._http_lock:
+            self._reset_headers()
+            url = f"{self.BASE_URL}{endpoint}"
+            if serial:
+                self.session.headers["seriale"] = serial
+            kwargs.setdefault("timeout", HTTP_TIMEOUT)
+            resp = self.session.request(method, url, verify=TLS_VERIFY, **kwargs)
+            if resp.status_code == 401:
+                if self.refresh_session():
+                    self._reset_headers()
+                    if serial:
+                        self.session.headers["seriale"] = serial
+                    resp = self.session.request(method, url, verify=TLS_VERIFY, **kwargs)
+            return resp
 
     # ------------------------------------------------------------------ #
     #  MQTT callbacks                                                      #
@@ -437,7 +454,13 @@ class MyThermowattBridge:
                 # Persisted in config.json so the counter survives bridge restarts.
                 now = time.time()
                 if serial in self._last_poll_ts:
-                    elapsed_h = (now - self._last_poll_ts[serial]) / 3600.0
+                    # Cap a single integration step at 2× the normal poll interval.
+                    # _last_poll_ts only advances on success, so after a poll outage
+                    # (429 backoff, cloud/network downtime) the next good poll would
+                    # otherwise attribute the entire gap to heating and inject a large
+                    # step into the total_increasing energy sensor.
+                    elapsed_s = min(now - self._last_poll_ts[serial], 2 * self.POLL_INTERVAL)
+                    elapsed_h = elapsed_s / 3600.0
                     if status_data.get('result', {}).get('heating'):
                         with self._config_lock:
                             bucket = self.config.setdefault('energy_kwh', {})
