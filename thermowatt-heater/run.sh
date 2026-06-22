@@ -4,8 +4,10 @@ set -e
 
 EMAIL=$(bashio::config 'email')
 PASSWORD=$(bashio::config 'password')
+ELEMENT_WATTAGE=$(bashio::config 'element_wattage' '3000')
 
 export MQTT_HOST
+export ELEMENT_WATTAGE
 export MQTT_PORT
 export MQTT_USER
 export MQTT_PASSWORD

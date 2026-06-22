@@ -25,6 +25,23 @@ AVAILABILITY_TOPIC = "thermowatt/bridge/status"
 HTTP_TIMEOUT = (5, 15)
 
 
+def _load_element_wattage() -> int:
+    """Read and validate ELEMENT_WATTAGE env var. Returns 3000 on any error."""
+    raw = os.getenv("ELEMENT_WATTAGE", "3000")
+    try:
+        w = int(raw)
+    except (ValueError, TypeError):
+        print(f"[WARN] Invalid ELEMENT_WATTAGE={raw!r} — defaulting to 3000 W")
+        return 3000
+    if not (100 <= w <= 10000):
+        print(f"[WARN] ELEMENT_WATTAGE={w} out of range [100, 10000] — defaulting to 3000 W")
+        return 3000
+    return w
+
+
+ELEMENT_WATTAGE: int = _load_element_wattage()
+
+
 class MyThermowattBridge:
     API_KEY  = "YVjArWssxKH631jv1dnnWOTr6gijsSAGz7rQJ4hJoUNRffxYvbQaMbePBEZalena"
     BASE_URL = "https://myapp-connectivity.com/api/v1"
@@ -36,13 +53,17 @@ class MyThermowattBridge:
     CONFIRM_WINDOW        = 60   # seconds — how long to stay in fast-poll after a command
     STATUS_LOG_INTERVAL   = 300  # seconds — 5-minute summary log
 
+    # Publish per-device "offline" availability after this many consecutive poll failures.
+    # At the 60s normal interval this is ~5 min of cloud silence before marking degraded.
+    DEGRADED_THRESHOLD = 5
+
     # Firmware-confirmed temperature ceiling from T_set_max attribute.
     # Hardware mechanical cutout at ~90°C is independent.
     TEMP_MIN = 20
     TEMP_MAX = 70  # matches confirmed T_set_max: 70 from device attributes
 
-    # CMD_COOLDOWN 15s — sufficient anti-spam for a resistive element.
-    # Strategic dwell time (20–30 min between EMS decisions) is enforced at HA/EMHASS layer.
+    # CMD_COOLDOWN per command type — MODE and TEMP each have their own 15s window so a
+    # valid paired sequence (MODE then TEMP, or vice versa) is never incorrectly blocked.
     CMD_COOLDOWN = 15  # seconds
 
     def __init__(self):
@@ -55,6 +76,10 @@ class MyThermowattBridge:
         # this lock, concurrent _reset_headers()/seriale mutations corrupt each
         # other's headers. Re-entrant because request() → refresh_session().
         self._http_lock = threading.RLock()
+
+        # Configured element wattage (W) — used for power sensor template and energy integration.
+        # Not a CT measurement; this is an estimate based on heating state only.
+        self.element_wattage: int = ELEMENT_WATTAGE
 
         # Single session instance — preserves cookies from AWS load balancers
         self.session = requests.Session()
@@ -78,11 +103,16 @@ class MyThermowattBridge:
         # Per-device status cache — used by _inject_fake_status
         self._last_status: dict = {}  # {serial: {result: {...}}}
 
-        # Per-device command cooldown tracking
-        self._last_cmd_time: dict = {}  # {serial: epoch float}
+        # Per-device command cooldown tracking keyed by command type.
+        # MODE and TEMP have independent windows so a paired sequence is not blocked.
+        self._last_cmd_time: dict = {}  # {serial: {"MODE": epoch, "TEMP": epoch}}
 
         # Per-device last successful poll timestamp — for energy accumulation
         self._last_poll_ts: dict = {}  # {serial: epoch float}
+
+        # Per-device degraded state tracking
+        self._consecutive_failures: dict = {}  # {serial: int}
+        self._last_successful_poll: dict = {}  # {serial: epoch float}
 
     # ------------------------------------------------------------------ #
     #  Config helpers                                                      #
@@ -187,6 +217,10 @@ class MyThermowattBridge:
                 device_serials = list(self.config.get('devices', {}).keys())
             for serial in device_serials:
                 client.subscribe(f"P/{serial}/CMD/#")
+                # Restore per-device availability consistent with current failure state
+                failures  = self._consecutive_failures.get(serial, 0)
+                dev_avail = "offline" if failures >= self.DEGRADED_THRESHOLD else "online"
+                client.publish(f"P/{serial}/availability", dev_avail, retain=True)
                 print(f"[MQTT] (Re)subscribed to P/{serial}/CMD/#")
             print("[MQTT] Connected — subscriptions restored, availability published online.")
         else:
@@ -202,7 +236,31 @@ class MyThermowattBridge:
     def _device_block(self, serial, name):
         return {"identifiers": [f"tw_{serial}"], "manufacturer": "Thermowatt", "name": name}
 
-    def _availability_block(self):
+    def _availability_block(self, serial: str) -> dict:
+        """Multi-availability: bridge-level LWT AND per-device poll health.
+        The entity goes unavailable if either the bridge disconnects (LWT fires)
+        or sustained poll failures mark the device offline.
+        """
+        return {
+            "availability": [
+                {
+                    "topic":                 AVAILABILITY_TOPIC,
+                    "payload_available":     "online",
+                    "payload_not_available": "offline",
+                },
+                {
+                    "topic":                 f"P/{serial}/availability",
+                    "payload_available":     "online",
+                    "payload_not_available": "offline",
+                },
+            ],
+            "availability_mode": "all",
+        }
+
+    def _bridge_availability_block(self) -> dict:
+        """Bridge-level availability only — used for diagnostic sensors so they remain
+        visible (and readable) even when per-device polling is failing.
+        """
         return {
             "availability_topic":    AVAILABILITY_TOPIC,
             "payload_available":     "online",
@@ -211,8 +269,10 @@ class MyThermowattBridge:
 
     def publish_discovery(self, serial, name):
         device       = self._device_block(serial, name)
-        avail        = self._availability_block()
+        avail        = self._availability_block(serial)
+        diag_avail   = self._bridge_availability_block()
         status_topic = f"P/{serial}/STATUS"
+        diag_topic   = f"P/{serial}/diagnostics"
 
         # ── Water Heater entity ─────────────────────────────────────────
         wh_payload = {
@@ -227,14 +287,17 @@ class MyThermowattBridge:
             "temperature_state_template":   "{{ value_json.result.T_SetPoint | default(0) | float }}",
             "temperature_command_topic":    f"P/{serial}/CMD/TEMP",
             "mode_state_topic":             status_topic,
+            # Unknown/absent Cmd values return empty string so HA treats the mode as
+            # unknown rather than falsely showing "Off" for an unrecognised state.
             "mode_state_template": (
-                "{% set cmd = value_json.result.Cmd | default(0) | int %}"
-                "{% if cmd == 9 %}Manual"
-                "{% elif cmd == 3 %}Eco"
-                "{% elif cmd == 17 %}Auto"
-                "{% elif cmd == 65 %}Holiday"
-                "{% elif cmd == 16 %}Off"
-                "{% else %}Off{% endif %}"
+                "{% set cmd = value_json.result.Cmd | default(none) %}"
+                "{% if cmd is none %}"
+                "{% elif cmd | int(-1) == 9 %}Manual"
+                "{% elif cmd | int(-1) == 3 %}Eco"
+                "{% elif cmd | int(-1) == 17 %}Auto"
+                "{% elif cmd | int(-1) == 65 %}Holiday"
+                "{% elif cmd | int(-1) == 16 %}Off"
+                "{% else %}{% endif %}"
             ),
             "mode_command_topic":       f"P/{serial}/CMD/MODE",
             "modes":                    ["Off", "Eco", "Manual", "Auto", "Holiday"],
@@ -267,14 +330,12 @@ class MyThermowattBridge:
         )
 
         # ── Power sensor — real-time draw derived from heating state ────
-        # 3000 W when heating, 0 W otherwise. Published on STATUS topic.
-        # HA entity: sensor.{device_slug}_{name_slug}_power
-        # (e.g. sensor.hws_hws_power for device "HWS", name "HWS Power")
+        # Uses configured element wattage; not a CT measurement — heating-state estimate only.
         power_payload = {
             "unique_id":            f"thermowatt_{serial}_power_w",
             "name":                 f"{name} Power",
             "state_topic":          status_topic,
-            "value_template":       "{{ 3000 if value_json.result.heating else 0 }}",
+            "value_template":       f"{{{{ {self.element_wattage} if value_json.result.heating else 0 }}}}",
             "unit_of_measurement":  "W",
             "device_class":         "power",
             "state_class":          "measurement",
@@ -289,7 +350,6 @@ class MyThermowattBridge:
 
         # ── Energy sensor — accumulated kWh (bridge-side integration) ──
         # Persisted in config.json — survives bridge restarts.
-        # Published on a dedicated topic; value is a plain float string.
         # state_class: total_increasing qualifies for HA Energy Dashboard.
         energy_payload = {
             "unique_id":            f"thermowatt_{serial}_energy_kwh",
@@ -309,7 +369,6 @@ class MyThermowattBridge:
         )
 
         # ── Individual sensors for EMS-critical fields ──────────────────
-        # Time_eco / Time_prog: state_class measurement until semantics confirmed.
         sensors = [
             {
                 "unique_id":            f"thermowatt_{serial}_t_avg",
@@ -425,6 +484,74 @@ class MyThermowattBridge:
                 json.dumps(s), retain=True
             )
 
+        # ── Diagnostic sensors (poll health + bridge config) ────────────
+        # These use bridge-level availability only so they remain readable
+        # (and show "degraded") even when per-device polling is failing.
+        diag_sensors = [
+            {
+                "unique_id":           f"thermowatt_{serial}_poll_interval",
+                "name":                f"{name} Poll Interval",
+                "state_topic":         diag_topic,
+                "value_template":      "{{ value_json.poll_interval | int }}",
+                "unit_of_measurement": "s",
+                "state_class":         "measurement",
+                "entity_category":     "diagnostic",
+                "icon":                "mdi:timer-sync-outline",
+                "slug":                "poll_interval",
+            },
+            {
+                "unique_id":       f"thermowatt_{serial}_consecutive_failures",
+                "name":            f"{name} Consecutive Poll Failures",
+                "state_topic":     diag_topic,
+                "value_template":  "{{ value_json.consecutive_failures | int }}",
+                "state_class":     "measurement",
+                "entity_category": "diagnostic",
+                "icon":            "mdi:cloud-alert-outline",
+                "slug":            "consecutive_failures",
+            },
+            {
+                "unique_id":       f"thermowatt_{serial}_last_successful_poll",
+                "name":            f"{name} Last Successful Poll",
+                "state_topic":     diag_topic,
+                "value_template":  (
+                    "{{ value_json.last_successful_poll "
+                    "if value_json.last_successful_poll is not none else none }}"
+                ),
+                "device_class":    "timestamp",
+                "entity_category": "diagnostic",
+                "icon":            "mdi:clock-check-outline",
+                "slug":            "last_successful_poll",
+            },
+            {
+                "unique_id":           f"thermowatt_{serial}_element_wattage",
+                "name":                f"{name} Element Wattage",
+                "state_topic":         diag_topic,
+                "value_template":      "{{ value_json.element_wattage | int }}",
+                "unit_of_measurement": "W",
+                "entity_category":     "diagnostic",
+                "icon":                "mdi:heating-coil",
+                "slug":                "element_wattage",
+            },
+            {
+                "unique_id":       f"thermowatt_{serial}_poll_status",
+                "name":            f"{name} Poll Status",
+                "state_topic":     diag_topic,
+                "value_template":  "{{ value_json.poll_status }}",
+                "entity_category": "diagnostic",
+                "icon":            "mdi:cloud-sync-outline",
+                "slug":            "poll_status",
+            },
+        ]
+
+        for s in diag_sensors:
+            slug = s.pop("slug")
+            s["device"] = device
+            s.update(diag_avail)
+            self.mqtt_client.publish(
+                f"homeassistant/sensor/{serial}/{slug}/config",
+                json.dumps(s), retain=True
+            )
+
     # ------------------------------------------------------------------ #
     #  Status publishing                                                   #
     # ------------------------------------------------------------------ #
@@ -436,6 +563,27 @@ class MyThermowattBridge:
         result['heating']   = (water_heater_sts & 1) != 0
         result['last_polled_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
         return status_data
+
+    def _publish_diagnostics(self, serial: str):
+        """Publish bridge diagnostic fields on the per-device diagnostics topic."""
+        ts = self._last_successful_poll.get(serial)
+        last_ok_str = (
+            datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+                .strftime('%Y-%m-%dT%H:%M:%S+00:00')
+            if ts is not None else None
+        )
+        failures = self._consecutive_failures.get(serial, 0)
+        payload = {
+            "poll_interval":        self.current_poll_interval,
+            "consecutive_failures": failures,
+            "last_successful_poll": last_ok_str,
+            "element_wattage":      self.element_wattage,
+            "poll_status":          "degraded" if failures >= self.DEGRADED_THRESHOLD else "ok",
+        }
+        try:
+            self.mqtt_client.publish(f"P/{serial}/diagnostics", json.dumps(payload), retain=True)
+        except Exception as e:
+            print(f"[WARN] Failed to publish diagnostics for {serial}: {e}")
 
     def poll_status(self, serial):
         """Poll status for a device — returns (success, status_code)."""
@@ -450,21 +598,20 @@ class MyThermowattBridge:
                 # QoS=1 — at-least-once delivery ensures HA always receives status updates.
                 self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status_data), qos=1, retain=True)
 
-                # Energy accumulation — integrates 3 kW × elapsed_hours when heating.
+                # Energy accumulation — integrates element_wattage × elapsed_hours when heating.
+                # _last_poll_ts only advances on success, so after a poll outage (429 backoff,
+                # cloud/network downtime) the next good poll could attribute the entire gap to
+                # heating. Cap at 2× the normal poll interval to bound the jump.
                 # Persisted in config.json so the counter survives bridge restarts.
                 now = time.time()
                 if serial in self._last_poll_ts:
-                    # Cap a single integration step at 2× the normal poll interval.
-                    # _last_poll_ts only advances on success, so after a poll outage
-                    # (429 backoff, cloud/network downtime) the next good poll would
-                    # otherwise attribute the entire gap to heating and inject a large
-                    # step into the total_increasing energy sensor.
                     elapsed_s = min(now - self._last_poll_ts[serial], 2 * self.POLL_INTERVAL)
                     elapsed_h = elapsed_s / 3600.0
                     if status_data.get('result', {}).get('heating'):
                         with self._config_lock:
-                            bucket = self.config.setdefault('energy_kwh', {})
-                            bucket[serial] = round(bucket.get(serial, 0.0) + 3.0 * elapsed_h, 4)
+                            bucket    = self.config.setdefault('energy_kwh', {})
+                            kwh_delta = (self.element_wattage / 1000.0) * elapsed_h
+                            bucket[serial] = round(bucket.get(serial, 0.0) + kwh_delta, 4)
                             self._save_config()
                 self._last_poll_ts[serial] = now
 
@@ -472,34 +619,61 @@ class MyThermowattBridge:
                     kwh = self.config.get('energy_kwh', {}).get(serial, 0.0)
                 self.mqtt_client.publish(f"P/{serial}/energy_kwh", kwh, qos=1, retain=True)
 
+                # Recovery — clear degraded state if we were previously failing
+                prev_failures = self._consecutive_failures.get(serial, 0)
+                self._consecutive_failures[serial] = 0
+                self._last_successful_poll[serial]  = now
+                if prev_failures >= self.DEGRADED_THRESHOLD:
+                    self.mqtt_client.publish(f"P/{serial}/availability", "online", retain=True)
+                    print(f"[POLL] {serial} recovered after {prev_failures} consecutive failures — device availability online")
+
+                self._publish_diagnostics(serial)
                 return (True, status_code)
+
             else:
+                failures = self._consecutive_failures.get(serial, 0) + 1
+                self._consecutive_failures[serial] = failures
+                if failures == self.DEGRADED_THRESHOLD:
+                    self.mqtt_client.publish(f"P/{serial}/availability", "offline", retain=True)
+                    print(f"[WARN] {serial} — {failures} consecutive poll failures. Device availability set offline.")
+                self._publish_diagnostics(serial)
                 return (False, status_code)
+
         except Exception as e:
             print(f"Poll error for {serial}: {e}")
+            failures = self._consecutive_failures.get(serial, 0) + 1
+            self._consecutive_failures[serial] = failures
+            if failures == self.DEGRADED_THRESHOLD:
+                try:
+                    self.mqtt_client.publish(f"P/{serial}/availability", "offline", retain=True)
+                except Exception:
+                    pass
+                print(f"[WARN] {serial} — {failures} consecutive poll failures (exception). Device availability set offline.")
+            self._publish_diagnostics(serial)
             return (False, None)
 
     # ------------------------------------------------------------------ #
     #  Command handling                                                    #
     # ------------------------------------------------------------------ #
 
-    def _check_cooldown(self, serial) -> bool:
-        """Returns True if enough time has passed since the last command.
-        Prevents rapid element cycling which stresses the heating element.
+    def _check_cooldown(self, serial: str, cmd_type: str) -> bool:
+        """Returns True if enough time has passed since the last command of this type.
+        MODE and TEMP track separate cooldown windows so a valid paired sequence
+        (e.g. MODE then TEMP immediately after) is not incorrectly blocked.
         """
-        last    = self._last_cmd_time.get(serial, 0)
+        last    = self._last_cmd_time.get(serial, {}).get(cmd_type, 0)
         elapsed = time.time() - last
         if elapsed < self.CMD_COOLDOWN:
             remaining = int(self.CMD_COOLDOWN - elapsed)
-            print(f"[CMD] Cooldown active for {serial} — {remaining}s remaining. Command ignored.")
+            print(f"[CMD] Cooldown active for {serial}/{cmd_type} — {remaining}s remaining. Command ignored.")
             return False
         return True
 
-    def _record_command(self, serial):
-        """Record command timestamp and enter fast-poll confirmation window."""
-        self._last_cmd_time[serial] = time.time()
-        self._confirm_until         = time.time() + self.CONFIRM_WINDOW
-        self.current_poll_interval  = self.POLL_INTERVAL_CONFIRM
+    def _record_command(self, serial: str, cmd_type: str):
+        """Record command timestamp for this type and enter fast-poll confirmation window."""
+        self._last_cmd_time.setdefault(serial, {})[cmd_type] = time.time()
+        self._confirm_until        = time.time() + self.CONFIRM_WINDOW
+        self.current_poll_interval = self.POLL_INTERVAL_CONFIRM
         print(f"[CMD] Confirmation window active — polling at {self.POLL_INTERVAL_CONFIRM}s for {self.CONFIRM_WINDOW}s")
 
     def on_mqtt_message(self, client, userdata, msg):
@@ -513,7 +687,7 @@ class MyThermowattBridge:
 
             payload = msg.payload.decode()
             parts   = msg.topic.split('/')
-            if len(parts) < 2:
+            if len(parts) < 4:
                 return
             sn = parts[1]
 
@@ -523,12 +697,21 @@ class MyThermowattBridge:
                 print(f"⚠️  Unknown device serial: {sn}")
                 return
 
-            if not self._check_cooldown(sn):
+            # Determine command type from topic suffix
+            if f"P/{sn}/CMD/TEMP" in msg.topic:
+                cmd_type = "TEMP"
+            elif f"P/{sn}/CMD/MODE" in msg.topic:
+                cmd_type = "MODE"
+            else:
+                print(f"[CMD] Unknown CMD topic: {msg.topic}")
+                return
+
+            if not self._check_cooldown(sn, cmd_type):
                 return
 
             current_fav = device_config.get("last_setpoint", 60)
 
-            if f"P/{sn}/CMD/TEMP" in msg.topic:
+            if cmd_type == "TEMP":
                 # Clamp to firmware-confirmed safe range before sending.
                 # Values above 70 are silently rejected by the device.
                 raw_temp = int(float(payload))
@@ -543,19 +726,19 @@ class MyThermowattBridge:
                         self.config['devices'][sn]["last_setpoint"] = temp
                         self._save_config()
                     self._inject_fake_status(sn, {"T_SetPoint": str(temp)})
-                    self._record_command(sn)
+                    self._record_command(sn, cmd_type)
                 else:
                     code = resp.status_code if resp else "no response"
                     print(f"[ERROR] Temperature command failed ({code}) — HA state not updated")
 
-            elif f"P/{sn}/CMD/MODE" in msg.topic:
+            elif cmd_type == "MODE":
                 print(f"[CMD] Setting Mode to {payload} for {sn}...")
 
                 if payload == "Manual":
                     resp = self.request("POST", "/manual", serial=sn, json={"T_SetPoint": current_fav})
                     if resp is not None and 200 <= resp.status_code < 300:
                         self._inject_fake_status(sn, {"Cmd": "9", "T_SetPoint": str(current_fav)})
-                        self._record_command(sn)
+                        self._record_command(sn, cmd_type)
                     else:
                         print(f"[ERROR] Manual command failed ({resp.status_code if resp else 'no response'})")
 
@@ -563,7 +746,7 @@ class MyThermowattBridge:
                     resp = self.request("POST", "/eco", serial=sn, headers={"Content-Type": "text/plain"}, data="")
                     if resp is not None and 200 <= resp.status_code < 300:
                         self._inject_fake_status(sn, {"Cmd": "3"})
-                        self._record_command(sn)
+                        self._record_command(sn, cmd_type)
                     else:
                         print(f"[ERROR] Eco command failed ({resp.status_code if resp else 'no response'})")
 
@@ -571,7 +754,7 @@ class MyThermowattBridge:
                     resp = self.request("POST", "/auto", serial=sn, headers={"Content-Type": "text/plain"}, data="")
                     if resp is not None and 200 <= resp.status_code < 300:
                         self._inject_fake_status(sn, {"Cmd": "17"})
-                        self._record_command(sn)
+                        self._record_command(sn, cmd_type)
                     else:
                         print(f"[ERROR] Auto command failed ({resp.status_code if resp else 'no response'})")
 
@@ -581,7 +764,7 @@ class MyThermowattBridge:
                     resp = self.request("POST", "/holiday", serial=sn, json={"end_date": future_date})
                     if resp is not None and 200 <= resp.status_code < 300:
                         self._inject_fake_status(sn, {"Cmd": "65"})
-                        self._record_command(sn)
+                        self._record_command(sn, cmd_type)
                     else:
                         print(f"[ERROR] Holiday command failed ({resp.status_code if resp else 'no response'})")
 
@@ -590,10 +773,14 @@ class MyThermowattBridge:
                     resp = self.request("POST", "/off", serial=sn, headers={"Content-Type": "text/plain"}, data="")
                     if resp is not None and 200 <= resp.status_code < 300:
                         self._inject_fake_status(sn, {"Cmd": "16"}, heating=False)
-                        self._record_command(sn)
+                        self._record_command(sn, cmd_type)
                         print(f"[SUCCESS] Boiler {sn} is now OFF")
                     else:
                         print(f"[ERROR] Off command failed ({resp.status_code if resp else 'no response'})")
+
+                else:
+                    print(f"[CMD] Unknown MODE payload: {payload!r} for {sn} — ignored "
+                          f"(valid: Off, Eco, Manual, Auto, Holiday)")
 
         except Exception as e:
             print(f"MQTT Cmd Error: {e}")
@@ -696,6 +883,9 @@ class MyThermowattBridge:
                         self.config['devices'][serial]["name"] = name
                     self._save_config()
 
+                # Publish per-device availability before discovery so sensors are not
+                # immediately unavailable between config publish and first poll.
+                self.mqtt_client.publish(f"P/{serial}/availability", "online", retain=True)
                 self.publish_discovery(serial, name)
                 print(f"🌉 Bridge active for: {name} ({serial})")
 
@@ -703,12 +893,12 @@ class MyThermowattBridge:
             print(f"FAILED: Step 4 - Could not retrieve thermostat list: {e}")
             sys.exit(1)
 
-        print("OK: Step 5 - Device discovery published.")
+        print(f"OK: Step 5 - Device discovery published. Element wattage: {self.element_wattage} W")
 
         self.mqtt_client.on_message = self.on_mqtt_message
         self.mqtt_client.loop_start()
 
-        print(f"OK: Step 6 - Polling loop starting (normal={self.POLL_INTERVAL}s, confirm={self.POLL_INTERVAL_CONFIRM}s).")
+        print(f"OK: Step 6 - Polling loop starting (normal={self.POLL_INTERVAL}s, confirm={self.POLL_INTERVAL_CONFIRM}s, degraded_threshold={self.DEGRADED_THRESHOLD}).")
 
         while True:
             try:

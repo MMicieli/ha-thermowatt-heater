@@ -5,6 +5,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Fork note:** This repository is forked from [waterheater-dev/ha-thermowatt-heater](https://github.com/waterheater-dev/ha-thermowatt-heater) at v1.3.0. Versions 1.0.0–1.3.0 reflect upstream history. Changes from v1.4.0 onwards are specific to this fork.
 
+## [1.6.3] - 2026-06-22
+
+### Added
+- `element_wattage` config option (default 3000 W) — used for MQTT power sensor template and bridge-side energy integration. Accepts integers in the range [100, 10000] W; values outside that range or non-integers fall back to 3000 W. Not a CT measurement — this is a heating-state estimate only.
+- Per-device degraded/offline availability: after `DEGRADED_THRESHOLD` (5) consecutive poll failures the per-device MQTT availability topic is set to `offline`, marking all device entities unavailable in HA. Entities recover to `online` automatically when polling resumes. Bridge-level LWT behaviour for unclean disconnects is preserved and independent.
+- Per-command-type cooldown: MODE and TEMP each maintain independent 15-second cooldown windows so a valid paired sequence (e.g. set mode then set temperature immediately after) is never incorrectly blocked by the other type's cooldown.
+- Diagnostic MQTT sensors on `P/{serial}/diagnostics`: `poll_interval` (s), `consecutive_failures` (count), `last_successful_poll` (ISO8601 timestamp), `element_wattage` (W), `poll_status` (`ok`/`degraded`). All read-only; remain available even when per-device polling is failing.
+- Multi-availability discovery payloads: operational entities now declare both the bridge-level LWT topic and the per-device availability topic (`availability_mode: all`). Diagnostic sensors use bridge-level availability only.
+
+### Fixed
+- `mode_state_template` unknown/absent `Cmd` values previously fell through to `Off` — they now return an empty string so HA treats the mode as unknown instead of falsely showing the device as Off.
+- Unknown MODE command payloads (values not in the valid set) now log a warning and perform no API call, rather than silently no-op without any log output.
+- Energy integration inherits the 2× poll-interval cap introduced in v1.6.2 (`elapsed_s` capped at `2 × POLL_INTERVAL`) and applies it with the configured `element_wattage` instead of the hardcoded 3 kW.
+
+---
+
 ## [1.6.2] - 2026-06-21
 ### Fixed
 - **Thread-safety of the shared `requests.Session`** — `login()`, `refresh_session()`, and `request()` now run under a re-entrant `_http_lock`. The session is not thread-safe and was mutated (`_reset_headers()`, `seriale`/`x-api-key`/`Authorization`) from both the main poll thread and the paho MQTT callback thread, which could clear/overwrite headers mid-flight and cause spurious 401s or a misrouted `seriale` on multi-device installs.
@@ -151,7 +167,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for temperature and mode control
 
 ---
+<<<<<<< HEAD
 [1.6.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.1...v1.6.2
+=======
+[1.6.3]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.1...v1.6.3
+>>>>>>> d3f9499 (fix(bridge): v1.6.3 hardening — wattage, degraded state, per-type cooldown, diagnostics)
 [1.6.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.0...v1.6.1
 [1.6.0]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.5.3...v1.6.0
 [1.5.3]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.5.2...v1.5.3
