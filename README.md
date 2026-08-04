@@ -8,32 +8,39 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 
 - **Real-time Monitoring**: Tank temperature via `T_Avg` (firmware average — more accurate than display value)
 - **Full Control**: Set target temperatures and operation modes (Manual / Eco / Auto / Holiday / Off)
-- **MQTT Discovery**: Automatically creates a Water Heater device with 9 sensors + 1 binary sensor
-- **EMS-ready Sensors**: Dedicated first-class entities for `T_Avg`, `T_dsrd`, `TBoost`, `TAmb`, `Time_eco`, `Time_prog`, `Rssi`, `WaterHeaterSts`, and `last_polled_at` — directly loggable to InfluxDB
-- **Availability Tracking**: MQTT LWT publishes `offline` when bridge stops; all entities show unavailable in HA
-- **Stale Data Protection**: `last_polled_at` timestamp enables HA-side stale detection
-- **Power & Energy Monitoring**: Real-time 3 kW draw sensor + accumulated kWh counter (persisted across restarts). Both qualify for the HA Energy Dashboard
-- **Safety Hardening**: Server-side temperature clamp (20–70°C), retained command rejection, HTTP timeouts, clean shutdown
+- **MQTT Discovery**: Automatically creates the water-heater entity, heating-state binary sensor, operational telemetry and bridge diagnostics
+- **EMS-ready Sensors**: Dedicated first-class entities for actual heating state, temperatures, mode, setpoint, poll freshness and estimated element power
+- **Availability Tracking**: Operational entities require both bridge connectivity and healthy device polling; diagnostic entities remain visible while device polling is degraded
+- **Stale Data Protection**: `last_polled_at` advances only after a successful device-status poll
+- **Command Confirmation**: HTTP success means submitted, not applied; MODE and TEMP remain pending until confirmed by newer device readback
+- **Power & Energy Monitoring**: Configurable heating-state power estimate plus accumulated estimated energy persisted across restarts
+- **Safety Hardening**: Temperature clamp (20–70°C), retained-command rejection, bounded confirmation, HTTP timeouts and clean shutdown
 
 ## Entities Created
 
 | Entity | Type | Description |
 |---|---|---|
-| `water_heater.<name>_boiler_<name>` | Water Heater | Mode and temperature control |
-| `binary_sensor.<name>_<name>_heating` | Binary Sensor | Element active state |
-| `sensor.<name>_<name>_average_temperature` | Sensor | T_Avg — firmware average tank temp (more accurate than display value) |
-| `sensor.<name>_<name>_desired_temperature` | Sensor | T_dsrd — current target setpoint |
-| `sensor.<name>_<name>_boost_ceiling` | Sensor | TBoost — maximum boost temperature |
-| `sensor.<name>_<name>_ambient_temperature` | Sensor | TAmb — installation environment temp (diagnostic) |
-| `sensor.<name>_<name>_eco_runtime` | Sensor | Time_eco — eco mode runtime counter (unit/reset behaviour unconfirmed) |
-| `sensor.<name>_<name>_programme_runtime` | Sensor | Time_prog — programme runtime counter (unit/reset behaviour unconfirmed) |
-| `sensor.<name>_<name>_wifi_signal` | Sensor | Rssi — WiFi signal strength in dBm (diagnostic) |
-| `sensor.<name>_<name>_water_heater_status_raw` | Sensor | WaterHeaterSts — raw status bitmask (diagnostic) |
-| `sensor.<name>_<name>_last_polled` | Sensor | last_polled_at — UTC timestamp of last successful poll (diagnostic) |
-| `sensor.<name>_<name>_power` | Sensor | Real-time power draw — 3000 W when heating, 0 W otherwise. Qualifies for HA Energy Dashboard |
-| `sensor.<name>_<name>_energy_kwh` | Sensor | Accumulated energy (kWh) — bridge-side integration, persisted across restarts. `state_class: total_increasing` |
+| `water_heater.<name>_boiler_<name>` | Water Heater | Mode and temperature control using confirmed device state |
+| `binary_sensor.<name>_<name>_heating` | Binary Sensor | Actual element-active state derived from `WaterHeaterSts` |
+| `sensor.<name>_<name>_average_temperature` | Sensor | `T_Avg` — firmware average tank temperature |
+| `sensor.<name>_<name>_desired_temperature` | Sensor | `T_dsrd` — desired temperature reported by the device |
+| `sensor.<name>_<name>_boost_ceiling` | Sensor | `TBoost` telemetry; this is not a selectable Boost operating mode |
+| `sensor.<name>_<name>_ambient_temperature` | Diagnostic Sensor | `TAmb` — installation-environment temperature |
+| `sensor.<name>_<name>_eco_runtime` | Sensor | `Time_eco` — unit/reset behaviour remains unconfirmed |
+| `sensor.<name>_<name>_programme_runtime` | Sensor | `Time_prog` — unit/reset behaviour remains unconfirmed |
+| `sensor.<name>_<name>_wifi_signal` | Diagnostic Sensor | `Rssi` — device Wi-Fi signal strength in dBm |
+| `sensor.<name>_<name>_water_heater_status_raw` | Diagnostic Sensor | Raw `WaterHeaterSts` bitmask |
+| `sensor.<name>_<name>_last_polled` | Diagnostic Sensor | UTC timestamp of the latest successful real status poll |
+| `sensor.<name>_<name>_power` | Sensor | Estimated element power: configured wattage while heating, otherwise 0 W; not a CT measurement |
+| `sensor.<name>_<name>_energy_kwh` | Sensor | Accumulated estimated energy from heating-state integration; persisted across restarts |
+| `sensor.<name>_<name>_poll_interval` | Diagnostic Sensor | Current bridge polling interval |
+| `sensor.<name>_<name>_consecutive_poll_failures` | Diagnostic Sensor | Consecutive failed device-status polls |
+| `sensor.<name>_<name>_last_successful_poll` | Diagnostic Sensor | UTC timestamp of the latest successful device-status poll |
+| `sensor.<name>_<name>_element_wattage` | Diagnostic Sensor | Configured wattage used for estimated power and energy |
+| `sensor.<name>_<name>_poll_status` | Diagnostic Sensor | Poll health: `ok` or `degraded` |
+| `sensor.<name>_<name>_command_status` | Diagnostic Sensor | Latest bounded command result; independent MODE and TEMP details are exposed as attributes |
 
-> **Note:** `<name>` is the device name set in the MyThermowatt app. For a device named `HWS`, entity IDs will be `water_heater.hws_boiler_hws`, `sensor.hws_hws_average_temperature`, etc.
+> **Note:** `<name>` is the device name set in the MyThermowatt app. For a device named `HWS`, entity IDs will be `water_heater.hws_boiler_hws`, `binary_sensor.hws_hws_heating`, and corresponding `sensor.hws_hws_*` entities.
 
 ## Installation
 
@@ -42,14 +49,18 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
    `https://github.com/MMicieli/ha-thermowatt-heater`
 3. Install the **Thermowatt Smart Boiler** add-on.
 4. Enter your MyThermowatt credentials in the **Configuration** tab.
-5. Start the add-on and check the **Log** tab.
+5. Set `element_wattage` to the heater element rating if it differs from 3000 W.
+6. Start the add-on and check the **Log** tab.
 
 ## Configuration
 
 ```yaml
 email: "your-email@example.com"
 password: "your-password"
+element_wattage: 3000
 ```
+
+`element_wattage` accepts an integer from 100 to 10000 W. Invalid values fall back to 3000 W with a warning. It affects estimated power and energy only.
 
 ### Optional environment variables
 
@@ -61,34 +72,48 @@ password: "your-password"
 | `MQTT_USER` | — | MQTT username if required |
 | `MQTT_PASSWORD` | — | MQTT password if required |
 
-## Polling Behaviour
+## Polling and Command Confirmation
 
 | Mode | Interval | When |
 |---|---|---|
 | Normal | 60s | Default operation |
-| Post-command | 20s | 60s window after a command is sent |
+| Post-command | 20s | Bounded 60s window after successful command submission |
 | Backoff | 120s–180s | After a 429 rate-limit response |
+
+A successful command response means the Thermowatt API accepted the submission; it does not prove the heater applied it. The bridge therefore:
+
+- records MODE and TEMP independently as `pending`;
+- wakes the polling loop so confirmation does not wait for the normal 60-second interval;
+- confirms MODE only from raw `Cmd` and TEMP only from `T_SetPoint`;
+- accepts only a status poll that started after submission;
+- reports a fresh non-matching result as `mismatched` after the deadline;
+- reports absence of a fresh status poll as `timed_out`;
+- never retries or republishes a command automatically.
+
+Operational `STATUS` and `last_polled_at` are never synthesised from a command request. They remain device-readback state suitable for Home Assistant orchestration and future EMHASS runtime accounting.
 
 ## Safety Design
 
-- Temperature commands are clamped to 20–70°C server-side before reaching the API (firmware `T_set_max: 70`)
-- Retained MQTT command messages are ignored on restart — prevents stale command replay
-- All cloud API calls have a (5s connect, 15s read) timeout — prevents hung requests freezing polling
-- Bridge publishes `offline` to availability topic on both clean shutdown and unclean disconnect (LWT)
-- SIGTERM from HA Supervisor triggers clean shutdown path
+- Temperature commands are clamped to 20–70°C before reaching the API (`T_set_max: 70`)
+- Retained MQTT command messages are ignored on restart to prevent stale command replay
+- MODE and TEMP have independent cooldowns so a valid paired sequence is not cross-blocked
+- All cloud API calls have a 5s connect and 15s read timeout
+- Five consecutive status-poll failures mark operational device entities unavailable
+- Bridge-level MQTT availability and per-device poll availability remain independent
+- SIGTERM from Home Assistant Supervisor follows the clean shutdown path
 
 ## Healthy Boot Log
 
-```
+```text
 --- BOOT SEQUENCE START ---
 OK: Step 1 - Credentials present.
 OK: Step 2 - MQTT TCP connection initiated.
 OK: Step 3 - Logged in to Thermowatt backend.
 OK: Step 4 - Found 1 thermostats.
-🌉 Bridge active for: HWS (4032429241482944)
-OK: Step 5 - Device discovery published.
+🌉 Bridge active for: HWS (serial)
+OK: Step 5 - Device discovery published. Element wattage: 3000 W
 [MQTT] Connected — subscriptions restored, availability published online.
-OK: Step 6 - Polling loop starting (normal=60s, confirm=20s).
+OK: Step 6 - Polling loop starting (normal=60s, confirm=20s, degraded_threshold=5).
 [STATUS] Polled 5 times, 5 x 200, 0 errors, interval=60s
 ```
 
@@ -104,4 +129,3 @@ _Tip: Help others by adding your version here if it works._
 ---
 
 _Disclaimer: This project is not affiliated with or endorsed by Thermowatt or Ariston._
-
