@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - fix/command-readback-confirmation
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
