@@ -5,6 +5,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 > **Fork note:** This repository is forked from [waterheater-dev/ha-thermowatt-heater](https://github.com/waterheater-dev/ha-thermowatt-heater) at v1.3.0. Versions 1.0.0–1.3.0 reflect upstream history. Changes from v1.4.0 onwards are specific to this fork.
 
+## [Unreleased]
+
+### Added
+- Bounded per-device command confirmation for MODE and TEMP. A successful API submission is recorded as `pending` until a newer device-status poll confirms the requested raw field.
+- `Command Status` MQTT diagnostic sensor with independent MODE and TEMP details, including requested and observed values plus confirmation timestamps.
+
+### Changed
+- Successful command submission no longer publishes synthetic operational `STATUS` data or advances `last_polled_at`.
+- The polling loop wakes promptly after successful submission and uses the existing 20-second interval for a bounded 60-second confirmation window.
+- A fresh non-matching readback becomes `mismatched` at the deadline; absence of a fresh readback becomes `timed_out`.
+- Commands are never automatically retried or republished after mismatch or timeout.
+- README terminology now identifies bridge-derived power and energy as estimates rather than measurements.
+
+---
+
 ## [1.6.3] - 2026-06-22
 
 ### Added
