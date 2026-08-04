@@ -5,6 +5,7 @@ import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 sys.argv = ["thermowatt_bridge.py"]
 
@@ -71,6 +72,18 @@ class TestCommandConfirmation:
         ]
         assert status_calls == []
         assert _diagnostics_payload(bridge)["command_status"] == "pending"
+
+    def test_pending_record_exists_before_poll_wakeup(self, bridge):
+        def assert_pending_before_wakeup():
+            record = bridge._command_state["SN"]["MODE"]
+            assert record["status"] == "pending"
+            assert record["requested"] == 3
+
+        with patch.object(bridge._poll_wakeup, "set", side_effect=assert_pending_before_wakeup) as wake, \
+             patch("thermowatt_bridge.time.time", return_value=100.0):
+            bridge._record_command("SN", "MODE", "Cmd", 3)
+
+        wake.assert_called_once_with()
 
     def test_poll_started_before_submission_cannot_confirm(self, bridge):
         with patch("thermowatt_bridge.time.time", return_value=100.0):
@@ -183,6 +196,25 @@ class TestCommandConfirmation:
         assert record["error"] == "503"
         assert "MODE" not in bridge._last_cmd_time.get("SN", {})
 
+    def test_request_exception_is_submit_failed_without_retry_or_cooldown(self, bridge):
+        msg = _message("P/SN/CMD/MODE", "Eco")
+
+        with patch.object(
+            bridge, "request", side_effect=requests.Timeout("cloud read timed out")
+        ) as request, patch("thermowatt_bridge.time.time", return_value=100.0):
+            bridge.on_mqtt_message(None, None, msg)
+
+        request.assert_called_once()
+        record = bridge._command_state["SN"]["MODE"]
+        assert record["status"] == "submit_failed"
+        assert "Timeout" in record["error"]
+        assert "MODE" not in bridge._last_cmd_time.get("SN", {})
+        status_calls = [
+            call for call in bridge.mqtt_client.publish.call_args_list
+            if call.args and call.args[0] == "P/SN/STATUS"
+        ]
+        assert status_calls == []
+
     def test_timeout_processing_never_republishes_command(self, bridge):
         with patch("thermowatt_bridge.time.time", return_value=100.0):
             bridge._record_command("SN", "MODE", "Cmd", 3)
@@ -226,6 +258,25 @@ class TestCommandConfirmation:
         assert payload["result"]["Cmd"] == 3
         assert "last_polled_at" in payload["result"]
         assert bridge._command_state["SN"]["MODE"]["status"] == "confirmed"
+
+    def test_temp_cache_persistence_failure_does_not_fail_real_status_poll(self, bridge):
+        with patch("thermowatt_bridge.time.time", return_value=100.0):
+            bridge._record_command("SN", "TEMP", "T_SetPoint", 55)
+        bridge.mqtt_client.publish.reset_mock()
+
+        with patch.object(bridge, "request", return_value=_response(setpoint=55)), \
+             patch.object(bridge, "_save_config", side_effect=OSError("disk unavailable")), \
+             patch("thermowatt_bridge.time.time", side_effect=[101.0, 102.0, 103.0]):
+            success, code = bridge.poll_status("SN")
+
+        assert (success, code) == (True, 200)
+        assert bridge._command_state["SN"]["TEMP"]["status"] == "confirmed"
+        assert bridge.config["devices"]["SN"]["last_setpoint"] == 55.0
+        status_calls = [
+            call for call in bridge.mqtt_client.publish.call_args_list
+            if call.args and call.args[0] == "P/SN/STATUS"
+        ]
+        assert len(status_calls) == 1
 
     def test_successful_submission_wakes_poll_loop(self, bridge):
         assert bridge._poll_wakeup.is_set() is False
