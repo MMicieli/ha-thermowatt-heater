@@ -612,11 +612,28 @@ class MyThermowattBridge:
                     f"observed={record.get('observed')!r}"
                 )
 
+    def _persist_confirmed_setpoint(self, serial: str, observed):
+        """Best-effort cache update; persistence failure must not invalidate readback."""
+        try:
+            confirmed = float(observed)
+            with self._config_lock:
+                device = self.config.get("devices", {}).get(serial)
+                if device is None:
+                    return
+                device["last_setpoint"] = confirmed
+                self._save_config()
+        except Exception as e:
+            print(
+                f"[WARN] Confirmed T_SetPoint={observed!r} for {serial}, "
+                f"but failed to persist last_setpoint cache: {e}"
+            )
+
     def _reconcile_pending_commands(
         self, serial: str, status_data: dict, poll_started_at: float, now: float
     ):
         """Confirm only from a real status poll that started after submission."""
         result = status_data.get("result", {})
+        confirmed_setpoint = None
         self._expire_pending_commands(serial, now)
         with self._command_lock:
             for record in self._command_state.get(serial, {}).values():
@@ -634,15 +651,14 @@ class MyThermowattBridge:
                     record["status"] = "confirmed"
                     record["completed_at"] = now
                     if record["field"] == "T_SetPoint":
-                        with self._config_lock:
-                            device = self.config.get("devices", {}).get(serial)
-                            if device is not None:
-                                device["last_setpoint"] = float(observed)
-                                self._save_config()
+                        confirmed_setpoint = observed
                     print(
                         f"[CMD] {serial}/{record['command_type']} confirmed by fresh readback — "
                         f"{record['field']}={observed!r}"
                     )
+
+        if confirmed_setpoint is not None:
+            self._persist_confirmed_setpoint(serial, confirmed_setpoint)
 
     def _command_diagnostics(self, serial: str, now: float):
         """Return one summary state plus per-command-type diagnostic details."""
@@ -788,7 +804,6 @@ class MyThermowattBridge:
         self._last_cmd_time.setdefault(serial, {})[cmd_type] = now
         self._confirm_until = max(self._confirm_until, now + self.CONFIRM_WINDOW)
         self.current_poll_interval = self.POLL_INTERVAL_CONFIRM
-        self._poll_wakeup.set()
 
         if field is not None:
             with self._command_lock:
@@ -806,6 +821,10 @@ class MyThermowattBridge:
                     "error": None,
                 }
             self._publish_diagnostics(serial)
+
+        # Wake only after the expectation exists, otherwise the poll thread could
+        # complete a matching readback before there is a pending record to reconcile.
+        self._poll_wakeup.set()
 
         print(
             f"[CMD] Confirmation window active — polling at "
@@ -832,6 +851,33 @@ class MyThermowattBridge:
                 "error": str(error),
             }
         self._publish_diagnostics(serial)
+
+    def _submit_command(
+        self, serial: str, cmd_type: str, field: str, requested, endpoint: str, **kwargs
+    ) -> bool:
+        """Submit once, then record either pending confirmation or submit_failed."""
+        try:
+            resp = self.request("POST", endpoint, serial=serial, **kwargs)
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            self._record_submission_failure(serial, cmd_type, field, requested, error)
+            print(
+                f"[ERROR] {serial}/{cmd_type} command transport failure ({error}) — "
+                "confirmed state unchanged"
+            )
+            return False
+
+        if resp is not None and 200 <= resp.status_code < 300:
+            self._record_command(serial, cmd_type, field, requested)
+            return True
+
+        code = resp.status_code if resp is not None else "no response"
+        self._record_submission_failure(serial, cmd_type, field, requested, code)
+        print(
+            f"[ERROR] {serial}/{cmd_type} command failed ({code}) — "
+            "confirmed state unchanged"
+        )
+        return False
 
     def on_mqtt_message(self, client, userdata, msg):
         """Local HA → REST API command handler."""
@@ -877,65 +923,64 @@ class MyThermowattBridge:
                     print(f"[CMD] Temperature {raw_temp}°C clamped to {temp}°C (firmware range {self.TEMP_MIN}–{self.TEMP_MAX}°C)")
                 print(f"[CMD] Setting Temperature to {temp}°C for {sn}...")
 
-                resp = self.request("POST", "/manual", serial=sn, json={"T_SetPoint": temp})
-                if resp is not None and 200 <= resp.status_code < 300:
-                    self._record_command(sn, cmd_type, "T_SetPoint", temp)
-                else:
-                    code = resp.status_code if resp is not None else "no response"
-                    self._record_submission_failure(sn, cmd_type, "T_SetPoint", temp, code)
-                    print(f"[ERROR] Temperature command failed ({code}) — confirmed state unchanged")
+                self._submit_command(
+                    sn, cmd_type, "T_SetPoint", temp, "/manual", json={"T_SetPoint": temp}
+                )
 
             elif cmd_type == "MODE":
                 print(f"[CMD] Setting Mode to {payload} for {sn}...")
 
                 if payload == "Manual":
-                    resp = self.request("POST", "/manual", serial=sn, json={"T_SetPoint": current_fav})
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._record_command(sn, cmd_type, "Cmd", 9)
-                    else:
-                        code = resp.status_code if resp is not None else "no response"
-                        self._record_submission_failure(sn, cmd_type, "Cmd", 9, code)
-                        print(f"[ERROR] Manual command failed ({code})")
+                    self._submit_command(
+                        sn, cmd_type, "Cmd", 9, "/manual", json={"T_SetPoint": current_fav}
+                    )
 
                 elif payload == "Eco":
-                    resp = self.request("POST", "/eco", serial=sn, headers={"Content-Type": "text/plain"}, data="")
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._record_command(sn, cmd_type, "Cmd", 3)
-                    else:
-                        code = resp.status_code if resp is not None else "no response"
-                        self._record_submission_failure(sn, cmd_type, "Cmd", 3, code)
-                        print(f"[ERROR] Eco command failed ({code})")
+                    self._submit_command(
+                        sn,
+                        cmd_type,
+                        "Cmd",
+                        3,
+                        "/eco",
+                        headers={"Content-Type": "text/plain"},
+                        data="",
+                    )
 
                 elif payload == "Auto":
-                    resp = self.request("POST", "/auto", serial=sn, headers={"Content-Type": "text/plain"}, data="")
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._record_command(sn, cmd_type, "Cmd", 17)
-                    else:
-                        code = resp.status_code if resp is not None else "no response"
-                        self._record_submission_failure(sn, cmd_type, "Cmd", 17, code)
-                        print(f"[ERROR] Auto command failed ({code})")
+                    self._submit_command(
+                        sn,
+                        cmd_type,
+                        "Cmd",
+                        17,
+                        "/auto",
+                        headers={"Content-Type": "text/plain"},
+                        data="",
+                    )
 
                 elif payload == "Holiday":
                     future_date = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
                     print(f"[CMD] Setting Holiday Mode until {future_date} for {sn}...")
-                    resp = self.request("POST", "/holiday", serial=sn, json={"end_date": future_date})
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._record_command(sn, cmd_type, "Cmd", 65)
-                    else:
-                        code = resp.status_code if resp is not None else "no response"
-                        self._record_submission_failure(sn, cmd_type, "Cmd", 65, code)
-                        print(f"[ERROR] Holiday command failed ({code})")
+                    self._submit_command(
+                        sn,
+                        cmd_type,
+                        "Cmd",
+                        65,
+                        "/holiday",
+                        json={"end_date": future_date},
+                    )
 
                 elif payload == "Off":
                     print(f"[CMD] Turning Boiler OFF for {sn}...")
-                    resp = self.request("POST", "/off", serial=sn, headers={"Content-Type": "text/plain"}, data="")
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._record_command(sn, cmd_type, "Cmd", 16)
+                    if self._submit_command(
+                        sn,
+                        cmd_type,
+                        "Cmd",
+                        16,
+                        "/off",
+                        headers={"Content-Type": "text/plain"},
+                        data="",
+                    ):
                         print(f"[CMD] Off command submitted for {sn}; awaiting fresh readback")
-                    else:
-                        code = resp.status_code if resp is not None else "no response"
-                        self._record_submission_failure(sn, cmd_type, "Cmd", 16, code)
-                        print(f"[ERROR] Off command failed ({code})")
 
                 else:
                     print(f"[CMD] Unknown MODE payload: {payload!r} for {sn} — ignored "
