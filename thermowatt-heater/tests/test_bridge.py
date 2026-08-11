@@ -421,12 +421,12 @@ class TestUnknownStateHardening:
         for mode in ("Manual", "Eco", "Auto", "Holiday", "Off"):
             assert mode in template, f"Expected '{mode}' in mode_state_template"
 
-    def test_mode_state_template_off_is_cmd_16_only(self, bridge):
-        """'Off' must appear in the cmd==16 branch, not as a catch-all fallback."""
+    def test_mode_state_template_off_is_cmd_8_only(self, bridge):
+        """Live device readback proves Off is Cmd=8, not a catch-all fallback."""
         payload = _discovery_payload(bridge, "water_heater")
         template = payload["mode_state_template"]
-        # The pattern 'int(-1) == 16 %}Off' (or similar) must be present
-        assert "16" in template
+        assert "int(-1) == 8 %}Off" in template
+        assert "int(-1) == 16 %}Off" not in template
         # And the else branch returns empty string (no text between %} and {% endif %})
         assert "{% else %}{% endif %}" in template
 

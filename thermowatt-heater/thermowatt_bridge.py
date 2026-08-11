@@ -1,6 +1,16 @@
-import sys, json, time, uuid, os, signal, threading, requests, urllib3, datetime
+import sys, json, time, uuid, os, signal, threading, requests, urllib3, datetime, builtins
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
+
+_ORIGINAL_PRINT = builtins.print
+
+
+def _timestamped_print(*args, **kwargs):
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    _ORIGINAL_PRINT(timestamp, *args, **kwargs)
+
+
+print = _timestamped_print
 
 # Proper TLS verification by default. Set THERMOWATT_TLS_NO_VERIFY=1 only if
 # the backend genuinely rejects certificate validation (debug fallback).
@@ -298,7 +308,7 @@ class MyThermowattBridge:
                 "{% elif cmd | int(-1) == 3 %}Eco"
                 "{% elif cmd | int(-1) == 17 %}Auto"
                 "{% elif cmd | int(-1) == 65 %}Holiday"
-                "{% elif cmd | int(-1) == 16 %}Off"
+                "{% elif cmd | int(-1) == 8 %}Off"
                 "{% else %}{% endif %}"
             ),
             "mode_command_topic":       f"P/{serial}/CMD/MODE",
@@ -975,7 +985,7 @@ class MyThermowattBridge:
                         sn,
                         cmd_type,
                         "Cmd",
-                        16,
+                        8,
                         "/off",
                         headers={"Content-Type": "text/plain"},
                         data="",
