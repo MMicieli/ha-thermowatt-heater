@@ -9,7 +9,7 @@ arch:
 init: false
 options:
   email: ""
-  password: password
+  password: ""
   element_wattage: 3000
 schema:
   email: str
