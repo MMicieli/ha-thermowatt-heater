@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.7.0] - 2026-08-11
+
 ### Added
 - Bounded per-device command confirmation for MODE and TEMP. A successful API submission is recorded as `pending` until a newer device-status poll confirms the requested raw field.
 - `Command Status` MQTT diagnostic sensor with independent MODE and TEMP details, including requested and observed values plus confirmation timestamps.
@@ -182,6 +186,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for temperature and mode control
 
 ---
+[1.7.0]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.3...v1.7.0
 [1.6.3]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.1...v1.6.2
 [1.6.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.0...v1.6.1
