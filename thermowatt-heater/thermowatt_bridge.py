@@ -97,15 +97,17 @@ class MyThermowattBridge:
         self.rate_limit_backoff    = 0  # 0=none, 1+=backoff steps
         self.current_poll_interval = self.POLL_INTERVAL
 
-        # Post-command fast-poll window tracking
+        # Post-command fast-poll window tracking. The event wakes the poll loop so
+        # a command submitted just after a normal poll does not wait up to 60 seconds
+        # before its first eligible confirmation poll.
         self._confirm_until: float = 0.0  # epoch time until which fast-poll is active
+        self._poll_wakeup = threading.Event()
 
-        # Per-device status cache — used by _inject_fake_status
-        self._last_status: dict = {}  # {serial: {result: {...}}}
-
-        # Per-device command cooldown tracking keyed by command type.
-        # MODE and TEMP have independent windows so a paired sequence is not blocked.
+        # Per-device command cooldown and confirmation state, keyed by command type.
+        # MODE and TEMP remain independent so a valid paired sequence is supported.
+        self._command_lock = threading.RLock()
         self._last_cmd_time: dict = {}  # {serial: {"MODE": epoch, "TEMP": epoch}}
+        self._command_state: dict = {}  # {serial: {"MODE"/"TEMP": confirmation record}}
 
         # Per-device last successful poll timestamp — for energy accumulation
         self._last_poll_ts: dict = {}  # {serial: epoch float}
@@ -541,6 +543,17 @@ class MyThermowattBridge:
                 "icon":            "mdi:cloud-sync-outline",
                 "slug":            "poll_status",
             },
+            {
+                "unique_id":                f"thermowatt_{serial}_command_status",
+                "name":                     f"{name} Command Status",
+                "state_topic":              diag_topic,
+                "value_template":           "{{ value_json.command_status }}",
+                "json_attributes_topic":    diag_topic,
+                "json_attributes_template": "{{ value_json.commands | tojson }}",
+                "entity_category":          "diagnostic",
+                "icon":                     "mdi:check-decagram-outline",
+                "slug":                     "command_status",
+            },
         ]
 
         for s in diag_sensors:
@@ -564,21 +577,136 @@ class MyThermowattBridge:
         result['last_polled_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
         return status_data
 
+    @staticmethod
+    def _isoformat_epoch(value):
+        """Return an epoch timestamp as UTC ISO8601, or None."""
+        if value is None:
+            return None
+        return datetime.datetime.fromtimestamp(
+            value, tz=datetime.timezone.utc
+        ).strftime('%Y-%m-%dT%H:%M:%S+00:00')
+
+    @staticmethod
+    def _command_value_matches(field, observed, requested):
+        """Compare raw readback with the normalised command expectation."""
+        try:
+            if field == "Cmd":
+                return int(observed) == int(requested)
+            if field == "T_SetPoint":
+                return abs(float(observed) - float(requested)) <= 0.1
+        except (TypeError, ValueError):
+            return False
+        return observed == requested
+
+    def _expire_pending_commands(self, serial: str, now: float):
+        """Bound pending commands without adding a retry or timer loop."""
+        with self._command_lock:
+            for record in self._command_state.get(serial, {}).values():
+                if record.get("status") != "pending" or now < record["deadline"]:
+                    continue
+                record["status"] = "mismatched" if record.get("fresh_poll_seen") else "timed_out"
+                record["completed_at"] = now
+                print(
+                    f"[CMD] {serial}/{record['command_type']} {record['status']} — "
+                    f"requested {record['field']}={record['requested']!r}, "
+                    f"observed={record.get('observed')!r}"
+                )
+
+    def _persist_confirmed_setpoint(self, serial: str, observed):
+        """Best-effort cache update; persistence failure must not invalidate readback."""
+        try:
+            confirmed = float(observed)
+            with self._config_lock:
+                device = self.config.get("devices", {}).get(serial)
+                if device is None:
+                    return
+                device["last_setpoint"] = confirmed
+                self._save_config()
+        except Exception as e:
+            print(
+                f"[WARN] Confirmed T_SetPoint={observed!r} for {serial}, "
+                f"but failed to persist last_setpoint cache: {e}"
+            )
+
+    def _reconcile_pending_commands(
+        self, serial: str, status_data: dict, poll_started_at: float, now: float
+    ):
+        """Confirm only from a real status poll that started after submission."""
+        result = status_data.get("result", {})
+        confirmed_setpoint = None
+        self._expire_pending_commands(serial, now)
+        with self._command_lock:
+            for record in self._command_state.get(serial, {}).values():
+                if record.get("status") != "pending":
+                    continue
+                if poll_started_at <= record["submitted_at"]:
+                    continue
+
+                observed = result.get(record["field"])
+                record["fresh_poll_seen"] = True
+                record["observed"] = observed
+                record["checked_at"] = now
+
+                if self._command_value_matches(record["field"], observed, record["requested"]):
+                    record["status"] = "confirmed"
+                    record["completed_at"] = now
+                    if record["field"] == "T_SetPoint":
+                        confirmed_setpoint = observed
+                    print(
+                        f"[CMD] {serial}/{record['command_type']} confirmed by fresh readback — "
+                        f"{record['field']}={observed!r}"
+                    )
+
+        if confirmed_setpoint is not None:
+            self._persist_confirmed_setpoint(serial, confirmed_setpoint)
+
+    def _command_diagnostics(self, serial: str, now: float):
+        """Return one summary state plus per-command-type diagnostic details."""
+        self._expire_pending_commands(serial, now)
+        with self._command_lock:
+            records = self._command_state.get(serial, {})
+
+            if any(r.get("status") == "pending" for r in records.values()):
+                summary = "pending"
+            elif records:
+                latest = max(
+                    records.values(),
+                    key=lambda r: r.get("completed_at") or r.get("submitted_at", 0),
+                )
+                summary = latest.get("status", "idle")
+            else:
+                summary = "idle"
+
+            serialised = {}
+            for cmd_type, record in records.items():
+                serialised[cmd_type] = {
+                    "status": record.get("status"),
+                    "field": record.get("field"),
+                    "requested": record.get("requested"),
+                    "observed": record.get("observed"),
+                    "submitted_at": self._isoformat_epoch(record.get("submitted_at")),
+                    "deadline": self._isoformat_epoch(record.get("deadline")),
+                    "checked_at": self._isoformat_epoch(record.get("checked_at")),
+                    "completed_at": self._isoformat_epoch(record.get("completed_at")),
+                    "fresh_poll_seen": bool(record.get("fresh_poll_seen")),
+                    "error": record.get("error"),
+                }
+            return summary, serialised
+
     def _publish_diagnostics(self, serial: str):
-        """Publish bridge diagnostic fields on the per-device diagnostics topic."""
+        """Publish bridge, poll-health and command-confirmation diagnostics."""
+        now = time.time()
         ts = self._last_successful_poll.get(serial)
-        last_ok_str = (
-            datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
-                .strftime('%Y-%m-%dT%H:%M:%S+00:00')
-            if ts is not None else None
-        )
         failures = self._consecutive_failures.get(serial, 0)
+        command_status, commands = self._command_diagnostics(serial, now)
         payload = {
             "poll_interval":        self.current_poll_interval,
             "consecutive_failures": failures,
-            "last_successful_poll": last_ok_str,
+            "last_successful_poll": self._isoformat_epoch(ts),
             "element_wattage":      self.element_wattage,
             "poll_status":          "degraded" if failures >= self.DEGRADED_THRESHOLD else "ok",
+            "command_status":       command_status,
+            "commands":             commands,
         }
         try:
             self.mqtt_client.publish(f"P/{serial}/diagnostics", json.dumps(payload), retain=True)
@@ -588,14 +716,16 @@ class MyThermowattBridge:
     def poll_status(self, serial):
         """Poll status for a device — returns (success, status_code)."""
         try:
+            poll_started_at = time.time()
             r           = self.request("GET", "/status", serial=serial)
             status_code = r.status_code
 
             if status_code == 200:
                 status_data = r.json()
                 status_data = self._compute_status(status_data)
-                self._last_status[serial] = status_data
-                # QoS=1 — at-least-once delivery ensures HA always receives status updates.
+                now = time.time()
+                self._reconcile_pending_commands(serial, status_data, poll_started_at, now)
+                # QoS=1 — at-least-once delivery ensures HA receives real polled state.
                 self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status_data), qos=1, retain=True)
 
                 # Energy accumulation — integrates element_wattage × elapsed_hours when heating.
@@ -603,7 +733,6 @@ class MyThermowattBridge:
                 # cloud/network downtime) the next good poll could attribute the entire gap to
                 # heating. Cap at 2× the normal poll interval to bound the jump.
                 # Persisted in config.json so the counter survives bridge restarts.
-                now = time.time()
                 if serial in self._last_poll_ts:
                     elapsed_s = min(now - self._last_poll_ts[serial], 2 * self.POLL_INTERVAL)
                     elapsed_h = elapsed_s / 3600.0
@@ -669,12 +798,86 @@ class MyThermowattBridge:
             return False
         return True
 
-    def _record_command(self, serial: str, cmd_type: str):
-        """Record command timestamp for this type and enter fast-poll confirmation window."""
-        self._last_cmd_time.setdefault(serial, {})[cmd_type] = time.time()
-        self._confirm_until        = time.time() + self.CONFIRM_WINDOW
+    def _record_command(self, serial: str, cmd_type: str, field=None, requested=None):
+        """Record cooldown and, when supplied, a bounded readback expectation."""
+        now = time.time()
+        self._last_cmd_time.setdefault(serial, {})[cmd_type] = now
+        self._confirm_until = max(self._confirm_until, now + self.CONFIRM_WINDOW)
         self.current_poll_interval = self.POLL_INTERVAL_CONFIRM
-        print(f"[CMD] Confirmation window active — polling at {self.POLL_INTERVAL_CONFIRM}s for {self.CONFIRM_WINDOW}s")
+
+        if field is not None:
+            with self._command_lock:
+                self._command_state.setdefault(serial, {})[cmd_type] = {
+                    "command_type": cmd_type,
+                    "status": "pending",
+                    "field": field,
+                    "requested": requested,
+                    "observed": None,
+                    "submitted_at": now,
+                    "deadline": now + self.CONFIRM_WINDOW,
+                    "checked_at": None,
+                    "completed_at": None,
+                    "fresh_poll_seen": False,
+                    "error": None,
+                }
+            self._publish_diagnostics(serial)
+
+        # Wake only after the expectation exists, otherwise the poll thread could
+        # complete a matching readback before there is a pending record to reconcile.
+        self._poll_wakeup.set()
+
+        print(
+            f"[CMD] Confirmation window active — polling at "
+            f"{self.POLL_INTERVAL_CONFIRM}s for {self.CONFIRM_WINDOW}s"
+        )
+
+    def _record_submission_failure(
+        self, serial: str, cmd_type: str, field: str, requested, error
+    ):
+        """Surface a rejected submission without changing confirmed device state."""
+        now = time.time()
+        with self._command_lock:
+            self._command_state.setdefault(serial, {})[cmd_type] = {
+                "command_type": cmd_type,
+                "status": "submit_failed",
+                "field": field,
+                "requested": requested,
+                "observed": None,
+                "submitted_at": now,
+                "deadline": now,
+                "checked_at": None,
+                "completed_at": now,
+                "fresh_poll_seen": False,
+                "error": str(error),
+            }
+        self._publish_diagnostics(serial)
+
+    def _submit_command(
+        self, serial: str, cmd_type: str, field: str, requested, endpoint: str, **kwargs
+    ) -> bool:
+        """Submit once, then record either pending confirmation or submit_failed."""
+        try:
+            resp = self.request("POST", endpoint, serial=serial, **kwargs)
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            self._record_submission_failure(serial, cmd_type, field, requested, error)
+            print(
+                f"[ERROR] {serial}/{cmd_type} command transport failure ({error}) — "
+                "confirmed state unchanged"
+            )
+            return False
+
+        if resp is not None and 200 <= resp.status_code < 300:
+            self._record_command(serial, cmd_type, field, requested)
+            return True
+
+        code = resp.status_code if resp is not None else "no response"
+        self._record_submission_failure(serial, cmd_type, field, requested, code)
+        print(
+            f"[ERROR] {serial}/{cmd_type} command failed ({code}) — "
+            "confirmed state unchanged"
+        )
+        return False
 
     def on_mqtt_message(self, client, userdata, msg):
         """Local HA → REST API command handler."""
@@ -720,63 +923,64 @@ class MyThermowattBridge:
                     print(f"[CMD] Temperature {raw_temp}°C clamped to {temp}°C (firmware range {self.TEMP_MIN}–{self.TEMP_MAX}°C)")
                 print(f"[CMD] Setting Temperature to {temp}°C for {sn}...")
 
-                resp = self.request("POST", "/manual", serial=sn, json={"T_SetPoint": temp})
-                if resp is not None and 200 <= resp.status_code < 300:
-                    with self._config_lock:
-                        self.config['devices'][sn]["last_setpoint"] = temp
-                        self._save_config()
-                    self._inject_fake_status(sn, {"T_SetPoint": str(temp)})
-                    self._record_command(sn, cmd_type)
-                else:
-                    code = resp.status_code if resp else "no response"
-                    print(f"[ERROR] Temperature command failed ({code}) — HA state not updated")
+                self._submit_command(
+                    sn, cmd_type, "T_SetPoint", temp, "/manual", json={"T_SetPoint": temp}
+                )
 
             elif cmd_type == "MODE":
                 print(f"[CMD] Setting Mode to {payload} for {sn}...")
 
                 if payload == "Manual":
-                    resp = self.request("POST", "/manual", serial=sn, json={"T_SetPoint": current_fav})
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._inject_fake_status(sn, {"Cmd": "9", "T_SetPoint": str(current_fav)})
-                        self._record_command(sn, cmd_type)
-                    else:
-                        print(f"[ERROR] Manual command failed ({resp.status_code if resp else 'no response'})")
+                    self._submit_command(
+                        sn, cmd_type, "Cmd", 9, "/manual", json={"T_SetPoint": current_fav}
+                    )
 
                 elif payload == "Eco":
-                    resp = self.request("POST", "/eco", serial=sn, headers={"Content-Type": "text/plain"}, data="")
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._inject_fake_status(sn, {"Cmd": "3"})
-                        self._record_command(sn, cmd_type)
-                    else:
-                        print(f"[ERROR] Eco command failed ({resp.status_code if resp else 'no response'})")
+                    self._submit_command(
+                        sn,
+                        cmd_type,
+                        "Cmd",
+                        3,
+                        "/eco",
+                        headers={"Content-Type": "text/plain"},
+                        data="",
+                    )
 
                 elif payload == "Auto":
-                    resp = self.request("POST", "/auto", serial=sn, headers={"Content-Type": "text/plain"}, data="")
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._inject_fake_status(sn, {"Cmd": "17"})
-                        self._record_command(sn, cmd_type)
-                    else:
-                        print(f"[ERROR] Auto command failed ({resp.status_code if resp else 'no response'})")
+                    self._submit_command(
+                        sn,
+                        cmd_type,
+                        "Cmd",
+                        17,
+                        "/auto",
+                        headers={"Content-Type": "text/plain"},
+                        data="",
+                    )
 
                 elif payload == "Holiday":
                     future_date = (datetime.datetime.now() + datetime.timedelta(days=30)).strftime("%Y-%m-%d")
                     print(f"[CMD] Setting Holiday Mode until {future_date} for {sn}...")
-                    resp = self.request("POST", "/holiday", serial=sn, json={"end_date": future_date})
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._inject_fake_status(sn, {"Cmd": "65"})
-                        self._record_command(sn, cmd_type)
-                    else:
-                        print(f"[ERROR] Holiday command failed ({resp.status_code if resp else 'no response'})")
+                    self._submit_command(
+                        sn,
+                        cmd_type,
+                        "Cmd",
+                        65,
+                        "/holiday",
+                        json={"end_date": future_date},
+                    )
 
                 elif payload == "Off":
                     print(f"[CMD] Turning Boiler OFF for {sn}...")
-                    resp = self.request("POST", "/off", serial=sn, headers={"Content-Type": "text/plain"}, data="")
-                    if resp is not None and 200 <= resp.status_code < 300:
-                        self._inject_fake_status(sn, {"Cmd": "16"}, heating=False)
-                        self._record_command(sn, cmd_type)
-                        print(f"[SUCCESS] Boiler {sn} is now OFF")
-                    else:
-                        print(f"[ERROR] Off command failed ({resp.status_code if resp else 'no response'})")
+                    if self._submit_command(
+                        sn,
+                        cmd_type,
+                        "Cmd",
+                        16,
+                        "/off",
+                        headers={"Content-Type": "text/plain"},
+                        data="",
+                    ):
+                        print(f"[CMD] Off command submitted for {sn}; awaiting fresh readback")
 
                 else:
                     print(f"[CMD] Unknown MODE payload: {payload!r} for {sn} — ignored "
@@ -784,39 +988,6 @@ class MyThermowattBridge:
 
         except Exception as e:
             print(f"MQTT Cmd Error: {e}")
-
-    def _inject_fake_status(self, serial, overrides, heating=None):
-        """Immediately updates HA state to prevent flipping while cloud syncs.
-        Only called after a confirmed 2xx API response.
-
-        heating: pass False/True to explicitly override the heating flag for mode
-        commands (e.g. Off). If None and WaterHeaterSts is not in overrides, the
-        last-polled heating value is preserved unchanged.
-        """
-        try:
-            status = json.loads(json.dumps(self._last_status.get(serial, {"result": {}})))
-            result = status.get('result', {})
-
-            for k, v in overrides.items():
-                result[k] = str(v)
-
-            # Only recompute heating from WaterHeaterSts when it is explicitly
-            # overridden — otherwise the stale cached value would be re-applied,
-            # hiding mode changes (e.g. Off) until the next real poll.
-            if 'WaterHeaterSts' in overrides:
-                water_heater_sts  = int(result.get('WaterHeaterSts', 0))
-                result['heating'] = (water_heater_sts & 1) != 0
-            elif heating is not None:
-                result['heating'] = heating
-            # else: keep the heating value from _last_status unchanged
-
-            result['last_polled_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
-
-            status['result'] = result
-            # QoS=1 matches poll_status — ensures HA receives the fake-state update.
-            self.mqtt_client.publish(f"P/{serial}/STATUS", json.dumps(status), qos=1, retain=True)
-        except Exception as e:
-            print(f"⚠️  Status injection failed for {serial}: {e}")
 
     # ------------------------------------------------------------------ #
     #  Logging                                                             #
@@ -902,6 +1073,10 @@ class MyThermowattBridge:
 
         while True:
             try:
+                # Clear at the start of the cycle. A command arriving during polling
+                # or the following wait remains set and wakes the next eligible poll.
+                self._poll_wakeup.clear()
+
                 # Exit fast-poll window once confirm period has elapsed
                 if self.current_poll_interval == self.POLL_INTERVAL_CONFIRM:
                     if time.time() >= self._confirm_until:
@@ -942,7 +1117,7 @@ class MyThermowattBridge:
                                 print(f"[ERROR] Re-login failed: {e}")
 
                 self.log_status_summary()
-                time.sleep(self.current_poll_interval)
+                self._poll_wakeup.wait(timeout=self.current_poll_interval)
 
             except KeyboardInterrupt:
                 print("Stopping...")
@@ -953,7 +1128,7 @@ class MyThermowattBridge:
                     self.login()
                 except Exception as e2:
                     print(f"[ERROR] Re-login failed: {e2}")
-                time.sleep(self.current_poll_interval)
+                self._poll_wakeup.wait(timeout=self.current_poll_interval)
 
         # Explicitly publish offline on clean shutdown.
         # LWT fires on unclean disconnect only; this covers clean add-on stop/restart.
