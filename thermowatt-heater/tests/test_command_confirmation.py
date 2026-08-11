@@ -73,6 +73,29 @@ class TestCommandConfirmation:
         assert status_calls == []
         assert _diagnostics_payload(bridge)["command_status"] == "pending"
 
+    def test_off_submission_expects_live_cmd8_and_confirms(self, bridge):
+        msg = _message("P/SN/CMD/MODE", "Off")
+
+        with patch.object(bridge, "request", return_value=_response(cmd=8)) as request, \
+             patch("thermowatt_bridge.time.time", return_value=100.0):
+            bridge.on_mqtt_message(None, None, msg)
+
+        request.assert_called_once_with(
+            "POST",
+            "/off",
+            serial="SN",
+            headers={"Content-Type": "text/plain"},
+            data="",
+        )
+        record = bridge._command_state["SN"]["MODE"]
+        assert record["requested"] == 8
+        assert record["status"] == "pending"
+
+        bridge._reconcile_pending_commands(
+            "SN", {"result": {"Cmd": "8"}}, poll_started_at=101.0, now=102.0
+        )
+        assert bridge._command_state["SN"]["MODE"]["status"] == "confirmed"
+
     def test_pending_record_exists_before_poll_wakeup(self, bridge):
         def assert_pending_before_wakeup():
             record = bridge._command_state["SN"]["MODE"]
