@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.7.1] - 2026-08-11
+
+### Fixed
+- Off mode now uses the live device readback `Cmd=8` for Home Assistant state discovery and bounded `/off` command confirmation, replacing the inherited `Cmd=16` assumption disproved during supervised device testing.
+
+### Changed
+- Existing bridge log output is now prefixed with ISO-8601 UTC timestamps at millisecond precision for easier command/poll correlation.
+
+---
+
 ## [1.7.0] - 2026-08-11
 
 ### Added
@@ -186,6 +196,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for temperature and mode control
 
 ---
+[1.7.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.3...v1.7.0
 [1.6.3]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.2...v1.6.3
 [1.6.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.1...v1.6.2
