@@ -411,7 +411,6 @@ class TestUnknownStateHardening:
         payload = _discovery_payload(bridge, "water_heater")
         assert payload is not None
         template = payload["mode_state_template"]
-        # Neither 'else %}Off' nor 'else%}Off' variants
         assert "else %}Off" not in template
         assert "else%}Off" not in template
 
@@ -421,13 +420,12 @@ class TestUnknownStateHardening:
         for mode in ("Manual", "Eco", "Auto", "Holiday", "Off"):
             assert mode in template, f"Expected '{mode}' in mode_state_template"
 
-    def test_mode_state_template_off_is_cmd_16_only(self, bridge):
-        """'Off' must appear in the cmd==16 branch, not as a catch-all fallback."""
+    def test_mode_state_template_off_is_cmd_8_only(self, bridge):
+        """Live device readback proves Off is Cmd=8, not a catch-all fallback."""
         payload = _discovery_payload(bridge, "water_heater")
         template = payload["mode_state_template"]
-        # The pattern 'int(-1) == 16 %}Off' (or similar) must be present
-        assert "16" in template
-        # And the else branch returns empty string (no text between %} and {% endif %})
+        assert "int(-1) == 8 %}Off" in template
+        assert "int(-1) == 16 %}Off" not in template
         assert "{% else %}{% endif %}" in template
 
     def test_unknown_mode_payload_no_api_call(self, bridge):
@@ -486,11 +484,9 @@ class TestUnknownStateHardening:
             if len(call.args) < 2:
                 continue
             topic = call.args[0]
-            # Only check the diagnostic sensor config topics
             if not any(f"/{slug}/config" in topic for slug in diag_slugs):
                 continue
             payload = json.loads(call.args[1])
-            # Must NOT have multi-availability array (which would go offline when device fails)
             assert "availability" not in payload or isinstance(payload["availability"], str), (
                 f"Diagnostic sensor {topic} must use single availability_topic, not array"
             )
