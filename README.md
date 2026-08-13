@@ -92,13 +92,15 @@ A successful command response means the Thermowatt API accepted the submission; 
 
 Operational `STATUS` and `last_polled_at` are never synthesised from a command request. They remain device-readback state suitable for Home Assistant orchestration and future EMHASS runtime accounting.
 
+A poll counts as successful only when it returns usable device status — HTTP 200 alone is not enough. The Thermowatt cloud API can return HTTP 200 with a body such as `{"success": false, "error": "Water heater not found, check the Wi-Fi connection"}` when it cannot locate the device. That response is treated as a poll failure through the same consecutive-failure/degraded-threshold path as a non-200 response: it does not advance `last_successful_poll`, does not reset the failure counter, is not published to `STATUS`, does not accumulate energy, and is not used to confirm a pending MODE/TEMP command. Diagnostics expose the reason as `last_poll_error`, cleared on the next valid poll.
+
 ## Safety Design
 
 - Temperature commands are clamped to 20–70°C before reaching the API (`T_set_max: 70`)
 - Retained MQTT command messages are ignored on restart to prevent stale command replay
 - MODE and TEMP have independent cooldowns so a valid paired sequence is not cross-blocked
 - All cloud API calls have a 5s connect and 15s read timeout
-- Five consecutive status-poll failures mark operational device entities unavailable
+- Five consecutive status-poll failures mark operational device entities unavailable — including an HTTP-200 response that does not carry usable device status
 - Bridge-level MQTT availability and per-device poll availability remain independent
 - SIGTERM from Home Assistant Supervisor follows the clean shutdown path
 

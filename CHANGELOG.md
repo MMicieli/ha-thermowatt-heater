@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A poll is now only treated as successful when it returns usable device status, not merely HTTP 200. The Thermowatt cloud API has been observed returning HTTP 200 with `{"success": false, "error": "Water heater not found, check the Wi-Fi connection"}` — no `result` object at all — which the bridge previously counted as a healthy poll (`poll_status: ok`, `consecutive_failures: 0`, `last_successful_poll` still advancing) while publishing that invalid body to the retained `STATUS` topic and reconciling pending MODE/TEMP commands against it (`observed=None`, false `mismatched`). Such a payload is now counted as a poll failure through the existing consecutive-failure/`DEGRADED_THRESHOLD`/availability machinery: it does not update `last_successful_poll`, does not reset the failure counter, does not advance energy accumulation, is not published to `STATUS`, and is not used to reconcile a pending command's `fresh_poll_seen`. Diagnostics gain a single `last_poll_error` field (cleared on the next valid poll) reflecting the reason for the most recent poll failure.
+
 ---
 
 ## [1.7.1] - 2026-08-11
