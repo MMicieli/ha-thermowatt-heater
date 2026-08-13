@@ -7,8 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.7.2] - 2026-08-13
+
 ### Fixed
-- A poll is now only treated as successful when it returns usable device status, not merely HTTP 200. The Thermowatt cloud API has been observed returning HTTP 200 with `{"success": false, "error": "Water heater not found, check the Wi-Fi connection"}` — no `result` object at all — which the bridge previously counted as a healthy poll (`poll_status: ok`, `consecutive_failures: 0`, `last_successful_poll` still advancing) while publishing that invalid body to the retained `STATUS` topic and reconciling pending MODE/TEMP commands against it (`observed=None`, false `mismatched`). Such a payload is now counted as a poll failure through the existing consecutive-failure/`DEGRADED_THRESHOLD`/availability machinery: it does not update `last_successful_poll`, does not reset the failure counter, does not advance energy accumulation, is not published to `STATUS`, and is not used to reconcile a pending command's `fresh_poll_seen`. Diagnostics gain a single `last_poll_error` field (cleared on the next valid poll) reflecting the reason for the most recent poll failure.
+- A poll is now only treated as successful when it returns usable device status, not merely HTTP 200. The Thermowatt cloud API has been observed returning HTTP 200 with `{"success": false, "error": "Water heater not found, check the Wi-Fi connection"}` — no `result` object at all — which the bridge previously counted as a healthy poll (`poll_status: ok`, `consecutive_failures: 0`, `last_successful_poll` still advancing) while publishing that invalid body to the retained `STATUS` topic and reconciling pending MODE/TEMP commands against it (`observed=None`, false `mismatched`). Such a payload is now counted as a poll failure through the existing consecutive-failure/`DEGRADED_THRESHOLD`/availability machinery: it does not update `last_successful_poll`, does not reset the failure counter, does not advance energy accumulation, is not published to `STATUS`, and is not used to reconcile a pending command's `fresh_poll_seen`. Diagnostics gain a single `last_poll_error` field (cleared on the next valid poll) reflecting the reason for the most recent poll failure. An empty `result` dict (`{"result": {}}`) is rejected the same way — a dict with no fields still carries no usable device status.
 
 ---
 
@@ -199,6 +203,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for temperature and mode control
 
 ---
+[1.7.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.7.1...v1.7.2
 [1.7.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.3...v1.7.0
 [1.6.3]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.2...v1.6.3
