@@ -602,7 +602,8 @@ class MyThermowattBridge:
             return False, "response body is not a JSON object"
         if status_data.get("success") is False:
             return False, status_data.get("error") or "success=false"
-        if not isinstance(status_data.get("result"), dict):
+        result = status_data.get("result")
+        if not isinstance(result, dict) or not result:
             return False, "response missing usable 'result' object"
         return True, None
 

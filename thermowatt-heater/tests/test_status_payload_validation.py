@@ -104,6 +104,12 @@ class TestInvalidStatusPayloadValidation:
         is_valid, reason = MyThermowattBridge._validate_status_payload({"result": "not a dict"})
         assert is_valid is False
 
+    def test_validator_rejects_empty_result(self):
+        """{"result": {}} is technically a dict but carries no device status."""
+        is_valid, reason = MyThermowattBridge._validate_status_payload({"result": {}})
+        assert is_valid is False
+        assert reason == "response missing usable 'result' object"
+
     def test_validator_accepts_normal_payload(self):
         is_valid, reason = MyThermowattBridge._validate_status_payload(
             {"result": {"Cmd": 9, "T_SetPoint": 60}}
@@ -118,6 +124,19 @@ class TestInvalidStatusPayloadValidation:
 
         assert success is False
         assert bridge._consecutive_failures["SN"] == 1
+
+    def test_empty_result_payload_is_rejected_end_to_end(self, bridge):
+        """HTTP 200 + {"result": {}} — a dict, but no usable device status."""
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"result": {}}
+
+        with patch.object(bridge, "request", return_value=resp):
+            success, status_code = bridge.poll_status("SN")
+
+        assert (success, status_code) == (False, None)
+        assert bridge._consecutive_failures["SN"] == 1
+        assert _status_calls(bridge) == []
 
     # 3 — last_successful_poll does not advance
     def test_invalid_200_payload_does_not_advance_last_successful_poll(self, bridge):
