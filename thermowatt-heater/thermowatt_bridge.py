@@ -125,6 +125,7 @@ class MyThermowattBridge:
         # Per-device degraded state tracking
         self._consecutive_failures: dict = {}  # {serial: int}
         self._last_successful_poll: dict = {}  # {serial: epoch float}
+        self._last_poll_error: dict = {}  # {serial: str|None} — reason for the most recent poll failure
 
     # ------------------------------------------------------------------ #
     #  Config helpers                                                      #
@@ -588,6 +589,24 @@ class MyThermowattBridge:
         return status_data
 
     @staticmethod
+    def _validate_status_payload(status_data):
+        """An HTTP 200 alone does not mean the poll returned usable device status.
+
+        The Thermowatt cloud API can return HTTP 200 with a body such as
+        {"success": false, "error": "Water heater not found, check the Wi-Fi
+        connection"} when it cannot locate the device — no `result` object at
+        all. Returns (True, None) for a usable payload, or (False, reason) for
+        one that must be treated as a poll failure rather than fresh state.
+        """
+        if not isinstance(status_data, dict):
+            return False, "response body is not a JSON object"
+        if status_data.get("success") is False:
+            return False, status_data.get("error") or "success=false"
+        if not isinstance(status_data.get("result"), dict):
+            return False, "response missing usable 'result' object"
+        return True, None
+
+    @staticmethod
     def _isoformat_epoch(value):
         """Return an epoch timestamp as UTC ISO8601, or None."""
         if value is None:
@@ -715,6 +734,7 @@ class MyThermowattBridge:
             "last_successful_poll": self._isoformat_epoch(ts),
             "element_wattage":      self.element_wattage,
             "poll_status":          "degraded" if failures >= self.DEGRADED_THRESHOLD else "ok",
+            "last_poll_error":      self._last_poll_error.get(serial),
             "command_status":       command_status,
             "commands":             commands,
         }
@@ -732,6 +752,22 @@ class MyThermowattBridge:
 
             if status_code == 200:
                 status_data = r.json()
+                is_valid, invalid_reason = self._validate_status_payload(status_data)
+                if not is_valid:
+                    # HTTP 200 with no usable device status — count it as a poll
+                    # failure using the existing failure/threshold machinery, not
+                    # as fresh state. Never falls through to STATUS publish,
+                    # energy accumulation or command reconciliation below.
+                    self._last_poll_error[serial] = invalid_reason
+                    failures = self._consecutive_failures.get(serial, 0) + 1
+                    self._consecutive_failures[serial] = failures
+                    print(f"[WARN] {serial} — invalid device status payload (HTTP 200): {invalid_reason}")
+                    if failures == self.DEGRADED_THRESHOLD:
+                        self.mqtt_client.publish(f"P/{serial}/availability", "offline", retain=True)
+                        print(f"[WARN] {serial} — {failures} consecutive poll failures. Device availability set offline.")
+                    self._publish_diagnostics(serial)
+                    return (False, None)
+
                 status_data = self._compute_status(status_data)
                 now = time.time()
                 self._reconcile_pending_commands(serial, status_data, poll_started_at, now)
@@ -762,6 +798,7 @@ class MyThermowattBridge:
                 prev_failures = self._consecutive_failures.get(serial, 0)
                 self._consecutive_failures[serial] = 0
                 self._last_successful_poll[serial]  = now
+                self._last_poll_error[serial]       = None
                 if prev_failures >= self.DEGRADED_THRESHOLD:
                     self.mqtt_client.publish(f"P/{serial}/availability", "online", retain=True)
                     print(f"[POLL] {serial} recovered after {prev_failures} consecutive failures — device availability online")
@@ -770,6 +807,7 @@ class MyThermowattBridge:
                 return (True, status_code)
 
             else:
+                self._last_poll_error[serial] = f"HTTP {status_code}"
                 failures = self._consecutive_failures.get(serial, 0) + 1
                 self._consecutive_failures[serial] = failures
                 if failures == self.DEGRADED_THRESHOLD:
@@ -780,6 +818,7 @@ class MyThermowattBridge:
 
         except Exception as e:
             print(f"Poll error for {serial}: {e}")
+            self._last_poll_error[serial] = str(e)
             failures = self._consecutive_failures.get(serial, 0) + 1
             self._consecutive_failures[serial] = failures
             if failures == self.DEGRADED_THRESHOLD:
