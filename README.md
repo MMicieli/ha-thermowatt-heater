@@ -6,7 +6,7 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 
 ## Features
 
-- **Real-time Monitoring**: Tank temperature via `T_Avg` (firmware average — more accurate than display value)
+- **Real-time Monitoring**: Device-reported tank temperature via `T_Avg`. Do not assume this is a well-mixed whole-tank average for thermal modelling; the verified Thermann Smart Electric installation documented by this project uses bottom-of-tank temperature sensing.
 - **Full Control**: Set target temperatures and operation modes (Manual / Eco / Auto / Holiday / Off)
 - **MQTT Discovery**: Automatically creates the water-heater entity, heating-state binary sensor, operational telemetry and bridge diagnostics
 - **EMS-ready Sensors**: Dedicated first-class entities for actual heating state, temperatures, mode, setpoint, poll freshness and estimated element power
@@ -22,7 +22,7 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 |---|---|---|
 | `water_heater.<name>_boiler_<name>` | Water Heater | Mode and temperature control using confirmed device state |
 | `binary_sensor.<name>_<name>_heating` | Binary Sensor | Actual element-active state derived from `WaterHeaterSts` |
-| `sensor.<name>_<name>_average_temperature` | Sensor | `T_Avg` — firmware average tank temperature |
+| `sensor.<name>_<name>_average_temperature` | Sensor | `T_Avg` — device-reported tank temperature; do not interpret as a proven well-mixed whole-tank average |
 | `sensor.<name>_<name>_desired_temperature` | Sensor | `T_dsrd` — desired temperature reported by the device |
 | `sensor.<name>_<name>_boost_ceiling` | Sensor | `TBoost` telemetry; this is not a selectable Boost operating mode |
 | `sensor.<name>_<name>_ambient_temperature` | Diagnostic Sensor | `TAmb` — installation-environment temperature |
