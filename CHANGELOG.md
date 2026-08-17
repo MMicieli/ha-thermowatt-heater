@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.7.3] - 2026-08-17
+
 ### Fixed
 - Raw `Cmd` is decoded as a bitfield (`family = Cmd & ~1`, `enabled = bool(Cmd & 1)`) instead of a hard-coded value list. Home Assistant mode state and Off command confirmation previously recognised only `Cmd=8` as Off; a read-only device-history audit (issue #13) found the device also reports `Cmd=64` (Holiday family, disabled) and, historically, `Cmd=16` (Auto family, disabled) as off-like states, none of which the bridge recognised — `Cmd=64` in particular caused Home Assistant to retain a stale prior mode (`Manual`) instead of showing `Off`. The new `decode_cmd()` helper resolves any recognised family with the enabled bit cleared to `Off`; unrecognised or absent/malformed `Cmd` remains unknown and is never defaulted to `Off`. The decoded mode is now computed once bridge-side and published as `ha_mode` in `STATUS`, and the MQTT discovery `mode_state_template` passes it through directly rather than duplicating bit logic in Jinja. Off command confirmation now accepts a fresh readback from any recognised family with the enabled bit cleared, not only an exact `Cmd=8` match. The `/off` endpoint and payload are unchanged.
 
@@ -206,6 +210,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support for temperature and mode control
 
 ---
+[1.7.3]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.7.2...v1.7.3
 [1.7.2]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.7.1...v1.7.2
 [1.7.1]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/MMicieli/ha-thermowatt-heater/compare/v1.6.3...v1.7.0
