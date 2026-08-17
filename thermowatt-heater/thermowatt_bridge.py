@@ -52,9 +52,51 @@ def _load_element_wattage() -> int:
 ELEMENT_WATTAGE: int = _load_element_wattage()
 
 
+# Raw Thermowatt Cmd is a bitfield: bit0 = enabled/on, the remaining bits select
+# a mode family. Enabled+known-family -> the named mode; the same family with
+# bit0 cleared is that family's inactive/Off sub-state.
+#
+# Manual(8), Auto(16) and Holiday(64) disabled (bit0=0) have been directly
+# observed on-device (issue #13 read-only audit). Eco family disabled (2) is
+# NOT an observed device value — it follows from the same bitfield contract
+# and is included so the decoder does not special-case only the values seen
+# so far, but must not be presented as captured evidence.
+KNOWN_CMD_FAMILIES = {
+    2:  "Eco",
+    8:  "Manual",
+    16: "Auto",
+    64: "Holiday",
+}
+
+
 class MyThermowattBridge:
     API_KEY  = "YVjArWssxKH631jv1dnnWOTr6gijsSAGz7rQJ4hJoUNRffxYvbQaMbePBEZalena"
     BASE_URL = "https://myapp-connectivity.com/api/v1"
+
+    # Sentinel `requested` value for Off MODE commands — confirmation is family-based
+    # (known family, bit0 cleared), not an exact-Cmd-value match. See decode_cmd().
+    CMD_OFF_SENTINEL = "OFF"
+
+    @staticmethod
+    def decode_cmd(raw):
+        """Decode a raw Thermowatt Cmd value into family/enabled/mode.
+
+        Returns {"known": bool, "family": int|None, "enabled": bool|None, "mode": str|None}.
+        `mode` is a named mode ("Eco"/"Manual"/"Auto"/"Holiday") when the family
+        is known and enabled, "Off" when the family is known and disabled, and
+        None when the family is unrecognised or raw is absent/malformed. Never
+        defaults an unknown value to "Off".
+        """
+        try:
+            cmd = int(raw)
+        except (TypeError, ValueError):
+            return {"known": False, "family": None, "enabled": None, "mode": None}
+        family  = cmd & ~1
+        enabled = bool(cmd & 1)
+        if family not in KNOWN_CMD_FAMILIES:
+            return {"known": False, "family": family, "enabled": enabled, "mode": None}
+        mode = KNOWN_CMD_FAMILIES[family] if enabled else "Off"
+        return {"known": True, "family": family, "enabled": enabled, "mode": mode}
 
     # Normal polling 60s — reduces cloud rate-limit risk and produces cleaner
     # InfluxDB calibration data. Post-command confirmation window uses 20s.
@@ -300,18 +342,13 @@ class MyThermowattBridge:
             "temperature_state_template":   "{{ value_json.result.T_SetPoint | default(0) | float }}",
             "temperature_command_topic":    f"P/{serial}/CMD/TEMP",
             "mode_state_topic":             status_topic,
-            # Unknown/absent Cmd values return empty string so HA treats the mode as
-            # unknown rather than falsely showing "Off" for an unrecognised state.
-            "mode_state_template": (
-                "{% set cmd = value_json.result.Cmd | default(none) %}"
-                "{% if cmd is none %}"
-                "{% elif cmd | int(-1) == 9 %}Manual"
-                "{% elif cmd | int(-1) == 3 %}Eco"
-                "{% elif cmd | int(-1) == 17 %}Auto"
-                "{% elif cmd | int(-1) == 65 %}Holiday"
-                "{% elif cmd | int(-1) == 8 %}Off"
-                "{% else %}{% endif %}"
-            ),
+            # ha_mode is computed bridge-side (decode_cmd) from the freshly polled raw
+            # Cmd bitfield so the family/enabled decode logic lives in one place, not
+            # duplicated in Jinja. Per HA MQTT water_heater semantics, an empty payload
+            # is IGNORED (it would retain a stale prior mode), while the literal string
+            # "None" resets the operation mode to unknown. Unknown/absent/malformed Cmd
+            # must therefore render as "None", not "" — never as "Off".
+            "mode_state_template": "{{ value_json.result.ha_mode | default('None', true) }}",
             "mode_command_topic":       f"P/{serial}/CMD/MODE",
             "modes":                    ["Off", "Eco", "Manual", "Auto", "Holiday"],
             "json_attributes_topic":    status_topic,
@@ -585,6 +622,13 @@ class MyThermowattBridge:
         result = status_data.get('result', {})
         water_heater_sts    = int(result.get('WaterHeaterSts', 0))
         result['heating']   = (water_heater_sts & 1) != 0
+        # Deterministic interpretation of the freshly polled raw Cmd — not a
+        # fabricated/synthetic device state. None (unknown/absent Cmd) serialises
+        # to JSON null; mode_state_template's `default('None', true)` renders that
+        # as the literal string "None", which HA's MQTT water_heater integration
+        # treats as an explicit mode reset to unknown (an empty payload is ignored
+        # instead and would retain a stale prior mode).
+        result['ha_mode']   = self.decode_cmd(result.get('Cmd')).get('mode')
         result['last_polled_at'] = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S+00:00')
         return status_data
 
@@ -618,7 +662,17 @@ class MyThermowattBridge:
 
     @staticmethod
     def _command_value_matches(field, observed, requested):
-        """Compare raw readback with the normalised command expectation."""
+        """Compare raw readback with the normalised command expectation.
+
+        Off confirmation is family-based (recognised mode family with bit0
+        cleared) rather than an exact Cmd match, since the device's disabled
+        sub-state raw value depends on which family was active beforehand
+        (e.g. 8, 16 or 64) — see decode_cmd(). All other MODE/TEMP commands
+        keep exact-value matching.
+        """
+        if field == "Cmd" and requested == MyThermowattBridge.CMD_OFF_SENTINEL:
+            decoded = MyThermowattBridge.decode_cmd(observed)
+            return decoded["known"] and not decoded["enabled"]
         try:
             if field == "Cmd":
                 return int(observed) == int(requested)
@@ -1025,7 +1079,7 @@ class MyThermowattBridge:
                         sn,
                         cmd_type,
                         "Cmd",
-                        8,
+                        self.CMD_OFF_SENTINEL,
                         "/off",
                         headers={"Content-Type": "text/plain"},
                         data="",

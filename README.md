@@ -94,6 +94,16 @@ Operational `STATUS` and `last_polled_at` are never synthesised from a command r
 
 A poll counts as successful only when it returns usable device status — HTTP 200 alone is not enough. The Thermowatt cloud API can return HTTP 200 with a body such as `{"success": false, "error": "Water heater not found, check the Wi-Fi connection"}` when it cannot locate the device. That response is treated as a poll failure through the same consecutive-failure/degraded-threshold path as a non-200 response: it does not advance `last_successful_poll`, does not reset the failure counter, is not published to `STATUS`, does not accumulate energy, and is not used to confirm a pending MODE/TEMP command. Diagnostics expose the reason as `last_poll_error`, cleared on the next valid poll.
 
+## Raw `Cmd` semantics
+
+Raw `Cmd` appears to encode a mode-family value plus a low enabled bit: `family = Cmd & ~1`, `enabled = bool(Cmd & 1)`. A family with the enabled bit set reports the named mode; the same family with the enabled bit cleared is that family's inactive/Off sub-state. This is decoded once, bridge-side, by `decode_cmd()` and published as `ha_mode` in `STATUS` — the MQTT discovery `mode_state_template` is a straight passthrough of that field, so the bitfield logic exists in one place rather than being duplicated in Jinja.
+
+Off is **not** exclusive to `Cmd=8`. Disabled values `8` (Manual family), `16` (Auto family) and `64` (Holiday family) have all been directly observed on-device and all resolve to Off. `Cmd=2` (Eco family, disabled) follows from the same bitfield contract but has **not** been captured in device history — it is an inferred value, not observed evidence. Home Assistant presents any recognised disabled family as `Off`; an unrecognised `Cmd` value (or an absent/malformed one) is reported as unknown, never defaulted to `Off` or to a stale prior mode. Raw `Cmd` remains available as a diagnostic attribute regardless of how `ha_mode` resolves it.
+
+The `/off` command endpoint and payload are unchanged. Confirmation of an Off command now accepts a fresh readback whose `Cmd` belongs to any recognised family with the enabled bit cleared, rather than requiring an exact `Cmd=8` match — this reflects that the device's disabled-state raw value depends on which family was active beforehand.
+
+A 2026-08-17 device-history anomaly (`Cmd=64`) appeared at a local-midnight boundary while Manual was active after an earlier Holiday period. Retained Holiday/date-boundary behaviour is a plausible hypothesis, but causation is not proven — treat it as unconfirmed background, not documented device behaviour.
+
 ## Safety Design
 
 - Temperature commands are clamped to 20–70°C before reaching the API (`T_set_max: 70`)

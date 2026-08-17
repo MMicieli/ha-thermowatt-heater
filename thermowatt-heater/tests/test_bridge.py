@@ -415,20 +415,36 @@ class TestUnknownStateHardening:
         assert "else %}Off" not in template
         assert "else%}Off" not in template
 
-    def test_mode_state_template_maps_all_known_modes(self, bridge):
+    def test_mode_state_template_reads_precomputed_ha_mode(self, bridge):
+        """Mode decode logic lives once in decode_cmd()/Python, not duplicated in
+        Jinja — the discovery template just passes through the bridge-computed
+        ha_mode field. Per HA's MQTT water_heater semantics, an EMPTY payload is
+        ignored (would retain a stale prior mode), while the literal string
+        "None" explicitly resets the operation mode to unknown — so unknown/
+        malformed Cmd must render as "None", never as "" and never as "Off"."""
         payload = _discovery_payload(bridge, "water_heater")
         template = payload["mode_state_template"]
-        for mode in ("Manual", "Eco", "Auto", "Holiday", "Off"):
-            assert mode in template, f"Expected '{mode}' in mode_state_template"
+        assert template == "{{ value_json.result.ha_mode | default('None', true) }}"
 
-    def test_mode_state_template_off_is_cmd_8_only(self, bridge):
-        """Live device readback proves Off is Cmd=8, not a catch-all fallback."""
-        payload = _discovery_payload(bridge, "water_heater")
-        template = payload["mode_state_template"]
-        assert "int(-1) == 8 %}Off" in template
-        assert "int(-1) == 16 %}Off" not in template
-        # And the else branch returns empty string (no text between %} and {% endif %})
-        assert "{% else %}{% endif %}" in template
+    def test_ha_mode_maps_all_known_families(self, bridge):
+        """decode_cmd (used to compute ha_mode) resolves every known enabled/
+        disabled family — Off is not exclusive to Cmd=8; 16 and 64 must also
+        resolve to Off (issue #13: Cmd=64 previously rendered as stale Manual)."""
+        expected = {
+            3: "Eco", 9: "Manual", 17: "Auto", 65: "Holiday",
+            8: "Off", 16: "Off", 64: "Off",
+        }
+        for cmd, mode in expected.items():
+            assert bridge.decode_cmd(cmd)["mode"] == mode, f"Cmd={cmd}"
+
+    def test_ha_mode_unknown_does_not_fall_back_to_off(self, bridge):
+        """decode_cmd stays None at the Python level for unknown/malformed Cmd —
+        the MQTT-layer "None" string is only produced by the discovery template's
+        default() filter, not by decode_cmd itself."""
+        for raw in (1, 5, None, "", "garbage"):
+            decoded = bridge.decode_cmd(raw)
+            assert decoded["known"] is False
+            assert decoded["mode"] is None
 
     def test_unknown_mode_payload_no_api_call(self, bridge):
         """An unrecognised MODE payload must not trigger any REST API call."""
@@ -495,3 +511,113 @@ class TestUnknownStateHardening:
                 f"Diagnostic sensor {topic} must use single availability_topic, not array"
             )
             assert "availability_topic" in payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Cmd bitfield decode (issue #13: family + bit0-enable semantics)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCmdBitfieldDecode:
+    """decode_cmd(): family = Cmd & ~1, enabled = bool(Cmd & 1).
+
+    8/16/64 disabled are directly observed device values (read-only audit on
+    issue #13). Cmd=2 disabled follows from the same bitfield contract but is
+    NOT an observed device value — tests below say so explicitly.
+    """
+
+    @pytest.mark.parametrize("cmd,mode", [(3, "Eco"), (9, "Manual"), (17, "Auto"), (65, "Holiday")])
+    def test_known_enabled_values(self, bridge, cmd, mode):
+        decoded = bridge.decode_cmd(cmd)
+        assert decoded == {"known": True, "family": cmd - 1, "enabled": True, "mode": mode}
+
+    @pytest.mark.parametrize("cmd", [8, 16, 64])
+    def test_observed_disabled_values_resolve_to_off(self, bridge, cmd):
+        """8, 16, 64 disabled are observed device values (not merely inferred)."""
+        decoded = bridge.decode_cmd(cmd)
+        assert decoded["known"] is True
+        assert decoded["enabled"] is False
+        assert decoded["mode"] == "Off"
+        assert decoded["family"] == cmd
+
+    def test_cmd_2_disabled_eco_is_inferred_not_observed(self, bridge):
+        """Cmd=2 (Eco family, bit0=0) has NOT been captured in device history.
+        The decoder resolves it via the same generic bitfield rule as 8/16/64,
+        not a hard-coded observed-value list — but this test documents that 2
+        itself is an inferred contract value, not live evidence."""
+        decoded = bridge.decode_cmd(2)
+        assert decoded == {"known": True, "family": 2, "enabled": False, "mode": "Off"}
+
+    @pytest.mark.parametrize("cmd", [0, 1, 4, 5, 32, 33, 128])
+    def test_unrecognised_family_is_unknown(self, bridge, cmd):
+        decoded = bridge.decode_cmd(cmd)
+        assert decoded["known"] is False
+        assert decoded["mode"] is None
+
+    @pytest.mark.parametrize("raw", [None, "", "abc", object()])
+    def test_absent_or_malformed_cmd_is_unknown(self, bridge, raw):
+        decoded = bridge.decode_cmd(raw)
+        assert decoded == {"known": False, "family": None, "enabled": None, "mode": None}
+
+    @pytest.mark.parametrize("raw,mode", [("9", "Manual"), ("64", "Off"), ("3", "Eco")])
+    def test_string_numeric_forms_supported(self, bridge, raw, mode):
+        assert bridge.decode_cmd(raw)["mode"] == mode
+
+    def test_unknown_never_defaults_to_off(self, bridge):
+        for raw in (1, 5, 100, None, "garbage"):
+            assert bridge.decode_cmd(raw)["mode"] != "Off"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. ha_mode in published STATUS (issue #13: Cmd=64 previously rendered stale)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHaModeInStatus:
+    def _poll_with_cmd(self, bridge, sn, cmd):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = {"result": {"WaterHeaterSts": 1, "T_Avg": 50.0, "T_SetPoint": 60.0, "Cmd": cmd}}
+        bridge.mqtt_client.publish.reset_mock()
+        with patch.object(bridge, "request", return_value=resp):
+            bridge.poll_status(sn)
+        for call in bridge.mqtt_client.publish.call_args_list:
+            if call.args and call.args[0] == f"P/{sn}/STATUS":
+                return json.loads(call.args[1])
+        return None
+
+    def test_cmd_64_renders_off_not_stale_manual(self, bridge):
+        """Regression for the exact issue #13 anomaly: a recognised disabled
+        family (64) must render Off, not retain a prior 'Manual' label."""
+        sn = "SN_64"
+        bridge.config["devices"][sn] = {"name": "Test", "last_setpoint": 60}
+        payload = self._poll_with_cmd(bridge, sn, 64)
+        assert payload["result"]["ha_mode"] == "Off"
+        assert payload["result"]["Cmd"] == 64  # raw Cmd preserved for diagnostics
+
+    def test_cmd_16_renders_off(self, bridge):
+        sn = "SN_16"
+        bridge.config["devices"][sn] = {"name": "Test", "last_setpoint": 60}
+        payload = self._poll_with_cmd(bridge, sn, 16)
+        assert payload["result"]["ha_mode"] == "Off"
+
+    def test_cmd_8_still_renders_off(self, bridge):
+        sn = "SN_8"
+        bridge.config["devices"][sn] = {"name": "Test", "last_setpoint": 60}
+        payload = self._poll_with_cmd(bridge, sn, 8)
+        assert payload["result"]["ha_mode"] == "Off"
+
+    @pytest.mark.parametrize("cmd,mode", [(3, "Eco"), (9, "Manual"), (17, "Auto"), (65, "Holiday")])
+    def test_enabled_modes_unchanged(self, bridge, cmd, mode):
+        sn = f"SN_EN_{cmd}"
+        bridge.config["devices"][sn] = {"name": "Test", "last_setpoint": 60}
+        payload = self._poll_with_cmd(bridge, sn, cmd)
+        assert payload["result"]["ha_mode"] == mode
+
+    def test_unknown_cmd_status_field_is_null_not_off(self, bridge):
+        """At the STATUS/Python layer, unknown Cmd yields ha_mode=None (JSON null),
+        never 'Off'. The MQTT discovery template (verified separately) turns that
+        null into the literal string "None" so HA resets mode to unknown instead
+        of ignoring an empty payload and retaining a stale prior mode."""
+        sn = "SN_UNK2"
+        bridge.config["devices"][sn] = {"name": "Test", "last_setpoint": 60}
+        payload = self._poll_with_cmd(bridge, sn, 99)
+        assert payload["result"]["ha_mode"] is None
