@@ -73,7 +73,10 @@ class TestCommandConfirmation:
         assert status_calls == []
         assert _diagnostics_payload(bridge)["command_status"] == "pending"
 
-    def test_off_submission_expects_live_cmd8_and_confirms(self, bridge):
+    def test_off_submission_expects_family_off_and_confirms(self, bridge):
+        """Off confirmation is family-based (known family, bit0 cleared), not an
+        exact Cmd=8 match — see issue #13. The submitted request is unchanged
+        (still POST /off, no body)."""
         msg = _message("P/SN/CMD/MODE", "Off")
 
         with patch.object(bridge, "request", return_value=_response(cmd=8)) as request, \
@@ -88,13 +91,51 @@ class TestCommandConfirmation:
             data="",
         )
         record = bridge._command_state["SN"]["MODE"]
-        assert record["requested"] == 8
+        assert record["requested"] == bridge.CMD_OFF_SENTINEL
         assert record["status"] == "pending"
 
         bridge._reconcile_pending_commands(
             "SN", {"result": {"Cmd": "8"}}, poll_started_at=101.0, now=102.0
         )
         assert bridge._command_state["SN"]["MODE"]["status"] == "confirmed"
+
+    @pytest.mark.parametrize("fresh_cmd", ["8", "16", "64"])
+    def test_off_confirms_for_any_known_disabled_family(self, bridge, fresh_cmd):
+        """A fresh Cmd belonging to ANY recognised family with bit0 cleared confirms
+        Off — not only the family that happened to be active before the command."""
+        with patch("thermowatt_bridge.time.time", return_value=100.0):
+            bridge._record_command("SN", "MODE", "Cmd", bridge.CMD_OFF_SENTINEL)
+
+        bridge._reconcile_pending_commands(
+            "SN", {"result": {"Cmd": fresh_cmd}}, poll_started_at=101.0, now=102.0
+        )
+        assert bridge._command_state["SN"]["MODE"]["status"] == "confirmed"
+
+    @pytest.mark.parametrize("fresh_cmd", ["3", "9", "17", "65"])
+    def test_off_does_not_confirm_for_enabled_cmd(self, bridge, fresh_cmd):
+        with patch("thermowatt_bridge.time.time", return_value=100.0):
+            bridge._record_command("SN", "MODE", "Cmd", bridge.CMD_OFF_SENTINEL)
+
+        bridge._reconcile_pending_commands(
+            "SN", {"result": {"Cmd": fresh_cmd}}, poll_started_at=101.0, now=120.0
+        )
+        record = bridge._command_state["SN"]["MODE"]
+        assert record["status"] == "pending"
+        assert record["fresh_poll_seen"] is True
+
+    def test_off_does_not_confirm_for_unknown_cmd(self, bridge):
+        with patch("thermowatt_bridge.time.time", return_value=100.0):
+            bridge._record_command("SN", "MODE", "Cmd", bridge.CMD_OFF_SENTINEL)
+
+        bridge._reconcile_pending_commands(
+            "SN", {"result": {"Cmd": "99"}}, poll_started_at=101.0, now=120.0
+        )
+        record = bridge._command_state["SN"]["MODE"]
+        assert record["status"] == "pending"
+        assert record["fresh_poll_seen"] is True
+
+        summary, commands = bridge._command_diagnostics("SN", now=161.0)
+        assert commands["MODE"]["status"] == "mismatched"
 
     def test_pending_record_exists_before_poll_wakeup(self, bridge):
         def assert_pending_before_wakeup():
