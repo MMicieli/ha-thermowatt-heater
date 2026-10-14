@@ -6,7 +6,7 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 
 ## Features
 
-- **Real-time Monitoring**: Device-reported tank temperature via `T_Avg`. Do not assume this is a well-mixed whole-tank average for thermal modelling; the verified Thermann Smart Electric installation documented by this project uses bottom-of-tank temperature sensing.
+- **Polled Device Monitoring**: Thermowatt cloud-status polling (normally every 60 seconds), forwarded to Home Assistant via local MQTT; this is **not** a real-time local-device feed. Device-reported tank temperature uses `T_Avg`. Do not assume this is a well-mixed whole-tank average for thermal modelling; the verified Thermann Smart Electric installation documented by this project uses bottom-of-tank temperature sensing.
 - **Full Control**: Set target temperatures and operation modes (Manual / Eco / Auto / Holiday / Off)
 - **MQTT Discovery**: Automatically creates the water-heater entity, heating-state binary sensor, operational telemetry and bridge diagnostics
 - **EMS-ready Sensors**: Dedicated first-class entities for actual heating state, temperatures, mode, setpoint, poll freshness and estimated element power
@@ -129,7 +129,9 @@ OK: Step 6 - Polling loop starting (normal=60s, confirm=20s, degraded_threshold=
 [STATUS] Polled 5 times, 5 x 200, 0 errors, interval=60s
 ```
 
-## Known to Work On
+## Historical compatibility observations (not a current-version guarantee)
+
+These versions were previously reported as working; they do not represent the latest Home Assistant release or certify all subsequent versions. For the current deployed EMS host/version, consult the separate main EMS repository's `docs/CURRENT_STATE.md`.
 
 - **Home Assistant OS** — Core 2025.12.5, Supervisor 2026.01.1, OS 16.3, Frontend 20251203.3
 - **Mosquitto MQTT** 6.5.2
