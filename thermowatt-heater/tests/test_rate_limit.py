@@ -657,7 +657,7 @@ class TestObservability:
         bridge.poll_status("SN")
         raw = _published(bridge, "P/SN/diagnostics")[-1].args[1]
         d = json.loads(raw)
-        assert set(d["rate_limit"]) == {"active", "retry_at", "backoff_step", "last_reason", "last_at", "events_total"}
+        assert set(d["rate_limit"]) == {"state", "active", "retry_at", "backoff_step", "last_reason", "last_at", "recovered_at", "events_total"}
         assert {"status", "command", "auth", "other", "total", "rate_limited_responses", "blocked", "day"} <= set(d["requests"])
         for secret in ("SECRET-ACCESS", "SECRET-REFRESH", bridge.API_KEY):
             assert secret not in raw
@@ -672,7 +672,7 @@ class TestObservability:
     def test_discovery_templates_render(self, bridge):
         jinja2 = pytest.importorskip("jinja2")
         bridge.publish_discovery("SN", "HWS")
-        diag = {"rate_limit": {"active": True}, "requests": {"total": 7}}
+        diag = {"rate_limit": {"active": True, "state": "active"}, "requests": {"total": 7}}
         env = jinja2.Environment()
         status = json.loads(_published(bridge, "homeassistant/sensor/SN/rate_limit_status/config")[-1].args[1])
         reqs = json.loads(_published(bridge, "homeassistant/sensor/SN/api_requests/config")[-1].args[1])

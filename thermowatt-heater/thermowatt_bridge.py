@@ -190,6 +190,7 @@ class MyThermowattBridge:
         self._rate_limit_until: float = 0.0
         self._rate_limit_reason = None
         self._rate_limit_last_at = None
+        self._rate_limit_recovered_at = None
         self._rate_limit_events_total: int = 0   # backoff windows started (lifetime)
         self._rate_limit_generation: int = 0     # +1 per classified rate-limit response
         self._request_counters: dict = self._new_counters(self._utc_day())
@@ -257,6 +258,7 @@ class MyThermowattBridge:
             self.rate_limit_backoff = max(0, int(rl.get("step") or 0))
             self._rate_limit_reason = rl.get("reason")
             self._rate_limit_last_at = rl.get("last_at")
+            self._rate_limit_recovered_at = rl.get("recovered_at")
             self._rate_limit_events_total = max(0, int(rl.get("events_total") or 0))
         except (TypeError, ValueError):
             self._rate_limit_until, self.rate_limit_backoff = 0.0, 0
@@ -398,6 +400,7 @@ class MyThermowattBridge:
                 return False
             self.rate_limit_backoff = 0
             self._rate_limit_until = 0.0
+            self._rate_limit_recovered_at = self._isoformat_epoch(time.time())
         self._persist_rate_limit()
         print("[RATE LIMIT] Recovered — backoff cleared")
         return True
@@ -409,6 +412,7 @@ class MyThermowattBridge:
                 "step": self.rate_limit_backoff,
                 "reason": self._rate_limit_reason,
                 "last_at": self._rate_limit_last_at,
+                "recovered_at": self._rate_limit_recovered_at,
                 "events_total": self._rate_limit_events_total,
             }
 
@@ -457,12 +461,22 @@ class MyThermowattBridge:
     def _rate_limit_diagnostics(self, now: float) -> dict:
         snap = self._rate_limit_snapshot()
         active = snap["until"] > now
+        # Three-way lifecycle (plus "none" before any event):
+        #   active               - backoff window running, no API traffic
+        #   recovery_unverified  - window over, but no successful poll has confirmed recovery
+        #   recovered            - a successful poll started after the last event cleared it
+        if snap["step"] > 0:
+            state = "active" if active else "recovery_unverified"
+        else:
+            state = "recovered" if snap["events_total"] > 0 else "none"
         return {
+            "state": state,
             "active": active,
             "retry_at": self._isoformat_epoch(snap["until"]) if active else None,
             "backoff_step": snap["step"],
             "last_reason": snap["reason"],
             "last_at": snap["last_at"],
+            "recovered_at": snap["recovered_at"],
             "events_total": snap["events_total"],
         }
 
@@ -492,10 +506,15 @@ class MyThermowattBridge:
         Pending commands are still expired (and republished) on their deadline.
         """
         end = time.time() + interval
+        was_limited = False
         while True:
             now = time.time()
             limited_for = self._rate_limit_remaining(now)
+            if limited_for <= 0 and was_limited:
+                was_limited = False
+                self._publish_all_diagnostics()  # window over: show recovery_unverified now
             if limited_for > 0:
+                was_limited = True
                 end = max(end, now + limited_for)
                 timeout = min(limited_for, self.DIAG_REFRESH_INTERVAL)
                 deadline = self._next_pending_deadline()
@@ -606,6 +625,13 @@ class MyThermowattBridge:
             if self._note_response(resp):
                 return resp  # quota errors never trigger re-authentication
             if resp.status_code == 401:
+                # Pre-existing, bounded auth replay (unrelated to rate-limit recovery):
+                # on HTTP 401 the token is refreshed and the SAME request - including a
+                # command POST with identical body - is re-sent exactly once, inside this
+                # call. A 401 is an authentication refusal, so the first attempt is
+                # assumed not to have been executed (vendor behaviour unverified). A
+                # second 401, a failed refresh or a rate limit ends the call; there is no
+                # loop, queue or later re-send.
                 if self.refresh_session():
                     self._reset_headers()
                     if serial:
@@ -952,7 +978,10 @@ class MyThermowattBridge:
                 "unique_id":                f"thermowatt_{serial}_rate_limit_status",
                 "name":                     f"{name} Rate Limit Status",
                 "state_topic":              diag_topic,
-                "value_template":           "{{ 'limited' if value_json.rate_limit.active else 'ok' }}",
+                "value_template":           (
+                    "{{ {'active': 'limited', 'recovery_unverified': 'recovery_unverified'}"
+                    ".get(value_json.rate_limit.state, 'ok') }}"
+                ),
                 "json_attributes_topic":    diag_topic,
                 "json_attributes_template": "{{ value_json.rate_limit | tojson }}",
                 "entity_category":          "diagnostic",
@@ -1376,9 +1405,11 @@ class MyThermowattBridge:
     ) -> bool:
         """Submit once, then record either pending confirmation or submit_failed.
 
-        Never queues or retries: a command refused locally (rate-limit window),
-        rejected by the API, or failed in transport is surfaced as submit_failed
-        and is not replayed after recovery.
+        Never queues, and never re-sends after rate-limit recovery: a command refused
+        locally (rate-limit window), rejected by the API, or failed in transport is
+        surfaced as submit_failed. The single exception is request()'s pre-existing
+        one-shot replay of the same POST after a successful HTTP 401 token refresh
+        (see request()); it happens inside this one call, never later.
         """
         try:
             resp = self.request("POST", endpoint, serial=serial, **kwargs)

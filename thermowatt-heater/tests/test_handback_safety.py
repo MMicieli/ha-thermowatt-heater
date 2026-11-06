@@ -6,7 +6,11 @@ by rendering Package 19's *actual* template expressions (copied verbatim below;
 see test_templates_match_package19_when_available) against the diagnostics this
 bridge really publishes, so the proof covers the real contract surface:
 
-  * ownership is cleared ONLY when the final confirmed-baseline template is true
+  * ownership is released by exactly TWO legitimate paths: (a) a confirmed baseline
+    restoration (final wait_template true), or (b) a recognised native non-Manual mode
+    (Off/Eco/Auto/Holiday) taking authority at one of the two native-mode guards, which
+    issues no temperature command. An unknown/unavailable/unrecognised mode is
+    fail-closed: no command, ownership untouched
   * the bridge never emits a queued/replayed physical command
   * the outstanding handback is identifiable from published diagnostics
 
@@ -61,6 +65,11 @@ TELEMETRY_FRESH = """
    and last_poll_age_s <= 120 %}
 {{ telemetry_fresh }}
 """
+# Native-mode authority guards (Issue #400): guard 1 before the optional TEMP 50, guard 2
+# before the baseline restore. Verbatim from Package 19.
+GUARD_KNOWN_NON_MANUAL = "{{ states('water_heater.hws_boiler_hws') in ['Off', 'Eco', 'Auto', 'Holiday'] }}"
+GUARD_NOT_MANUAL = "{{ not is_state('water_heater.hws_boiler_hws', 'Manual') }}"
+BRIDGE_ENTITY_USABLE = "{{ states('water_heater.hws_boiler_hws') not in ['unknown', 'unavailable'] }}"
 COMMAND_STATUS_HEALTHY = "{{ states('sensor.outside_hws_hws_command_status') in ['idle', 'confirmed'] }}"
 
 
@@ -164,6 +173,7 @@ class HA:
     def __init__(self, bridge, clock):
         self.bridge, self.clock = bridge, clock
         self.ownership = True
+        self.mode_override = None   # force the water_heater state (e.g. 'unavailable')
         self.env = jinja2.Environment()
         self.env.globals.update(
             states=self.states, state_attr=self.state_attr, is_state=self.is_state,
@@ -182,7 +192,7 @@ class HA:
     def states(self, entity):
         diag, res = self._last("P/SN/diagnostics") or {}, self._result()
         return {
-            "water_heater.hws_boiler_hws": res.get("ha_mode") or "unknown",
+            "water_heater.hws_boiler_hws": self.mode_override or res.get("ha_mode") or "unknown",
             "binary_sensor.hws_hws_heating": {True: "on", False: "off"}.get(res.get("heating"), "unknown"),
             "sensor.outside_hws_hws_command_status": diag.get("command_status", "unknown"),
             "sensor.outside_hws_hws_poll_status": diag.get("poll_status", "unknown"),
@@ -218,25 +228,50 @@ class HA:
     def _set_temperature(self, value):
         self.bridge.on_mqtt_message(None, None, _message("P/SN/CMD/TEMP", str(value)))
 
+    def _native_guard(self):
+        """Package 19 native-mode authority guard. Returns 'proceed' | 'released' | 'stop'."""
+        if self.render(GUARD_KNOWN_NON_MANUAL):
+            self.ownership = False          # path (b): native choice is authoritative
+            return "released"
+        if self.render(GUARD_NOT_MANUAL):
+            return "stop"                   # unknown/unrecognised: fail closed
+        return "proceed"
+
     def run_handback(self, baseline_c, between_stages=None):
         if not self.ownership:
             return "no_ownership"
+        # Bounded wait for the bridge entity to be usable, then a halting condition.
+        usable = self.render(BRIDGE_ENTITY_USABLE)
+        for _ in range(3):
+            if usable:
+                break
+            self.clock.now += 20
+            self.bridge._run_poll_cycle()
+            usable = self.render(BRIDGE_ENTITY_USABLE)
+        if not usable:
+            return "bridge_unavailable_stop"
         heating = self.states("binary_sensor.hws_hws_heating")
         t_avg = self.state_attr("water_heater.hws_boiler_hws", "T_Avg")
         if heating == "on" and t_avg is not None and float(t_avg) > 50:
-            if self.states("water_heater.hws_boiler_hws") != "Manual":
-                return "mode_guard_stop"
+            guard = self._native_guard()
+            if guard == "released":
+                return "native_authority_released"
+            if guard == "stop":
+                return "native_mode_unknown_stop"
             self._set_temperature(50)
             if not self._wait(WAIT_TEMP_50):
                 return "soft_stop_not_confirmed"   # ownership untouched
         if between_stages:
             between_stages()
-        if self.states("water_heater.hws_boiler_hws") != "Manual":
-            return "mode_guard_stop"
+        guard = self._native_guard()
+        if guard == "released":
+            return "native_authority_released"
+        if guard == "stop":
+            return "native_mode_unknown_stop"
         self._set_temperature(int(baseline_c))
         if not self._wait(WAIT_BASELINE, baseline_c=float(baseline_c)):
             return "baseline_not_confirmed"        # ownership untouched
-        self.ownership = False                      # the ONLY place ownership is released
+        self.ownership = False                      # path (a): confirmed baseline restoration
         return "released"
 
 
@@ -397,6 +432,119 @@ class TestBoostRateLimitHandbackFailure:
         assert ha.render(COMMAND_STATUS_HEALTHY) is False
 
 
+NATIVE_CMD = {"Off": 8, "Eco": 3, "Auto": 17, "Holiday": 65}
+
+
+def _native_mode(world, mode_cmd):
+    api, ha, bridge, clock = world
+    api.mode_cmd = mode_cmd
+    clock.now += 60
+    bridge._run_poll_cycle()
+
+
+class TestOwnershipReleasePaths:
+    """Package 19 releases ownership via (a) confirmed baseline or (b) native non-Manual authority."""
+
+    def test_path_a_confirmed_baseline_releases(self, world):
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        assert ha.run_handback(baseline_c=55) == "released"
+        assert ha.ownership is False and api.setpoint == 55
+
+    @pytest.mark.parametrize("mode", list(NATIVE_CMD))
+    @pytest.mark.parametrize("element_heating", [True, False], ids=["guard1", "guard2"])
+    def test_path_b_native_non_manual_mode_releases_without_any_command(self, world, mode, element_heating):
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        if not element_heating:
+            api.t_avg = 80.0                     # setpoint 70 < T_Avg: not heating -> guard 2 only
+        _native_mode(world, NATIVE_CMD[mode])
+        assert ha.states("water_heater.hws_boiler_hws") == mode
+        assert ha.states("binary_sensor.hws_hws_heating") == ("on" if element_heating else "off")
+        posts = list(api.command_posts())
+        assert ha.run_handback(baseline_c=55) == "native_authority_released"
+        assert ha.ownership is False
+        assert api.command_posts() == posts       # no temperature command issued
+        assert api.setpoint == 70
+
+    @pytest.mark.parametrize("mode", list(NATIVE_CMD))
+    def test_native_mode_taking_over_mid_handback_skips_baseline(self, world, mode):
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        posts = len(api.command_posts())
+        result = ha.run_handback(baseline_c=55, between_stages=lambda: _native_mode(world, NATIVE_CMD[mode]))
+        assert result == "native_authority_released"
+        assert ha.ownership is False
+        assert [p[2] for p in api.command_posts()[posts:]] == ["manual"]   # soft stop only; no baseline
+        assert api.setpoint == 50
+
+    def test_unknown_mode_at_entry_fails_closed(self, world):
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        _native_mode(world, 4)                    # unrecognised Cmd family -> ha_mode None -> 'unknown'
+        assert ha.states("water_heater.hws_boiler_hws") == "unknown"
+        posts = list(api.command_posts())
+        assert ha.run_handback(baseline_c=55) == "bridge_unavailable_stop"
+        assert ha.ownership is True and api.command_posts() == posts
+
+    def test_unavailable_entity_at_entry_fails_closed(self, world):
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        ha.mode_override = "unavailable"
+        posts = list(api.command_posts())
+        assert ha.run_handback(baseline_c=55) == "bridge_unavailable_stop"
+        assert ha.ownership is True and api.command_posts() == posts
+
+    @pytest.mark.parametrize("mode", ["Boost", "manual", "Heat"])
+    @pytest.mark.parametrize("element_heating", [True, False], ids=["guard1", "guard2"])
+    def test_unrecognised_mode_fails_closed_with_no_command(self, world, mode, element_heating):
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        if not element_heating:
+            api.t_avg = 80.0
+            clock.now += 60
+            bridge._run_poll_cycle()
+        ha.mode_override = mode
+        posts = list(api.command_posts())
+        assert ha.run_handback(baseline_c=55) == "native_mode_unknown_stop"
+        assert ha.ownership is True and api.command_posts() == posts
+
+    def test_unknown_mode_mid_run_blocks_baseline_and_retains_ownership(self, world):
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        posts = len(api.command_posts())
+        result = ha.run_handback(baseline_c=55, between_stages=lambda: _native_mode(world, 4))
+        assert result == "native_mode_unknown_stop"
+        assert ha.ownership is True
+        assert [p[2] for p in api.command_posts()[posts:]] == ["manual"]   # soft stop only
+        assert api.setpoint == 50
+
+    def test_rate_limit_plus_native_authority_still_releases_without_commands(self, world):
+        """If the user takes the heater native while the API is limited, Package 19 still
+        releases ownership (path b) and the bridge sends nothing."""
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        _native_mode(world, NATIVE_CMD["Off"])    # last good telemetry shows native Off
+        _start_quota(api, clock)
+        clock.now += 60
+        bridge._run_poll_cycle()
+        assert bridge._rate_limit_remaining() > 0
+        posts = list(api.command_posts())
+        assert ha.run_handback(baseline_c=55) == "native_authority_released"
+        assert ha.ownership is False and api.command_posts() == posts
+
+    def test_rate_limit_with_unknown_native_mode_retains_ownership(self, world):
+        api, ha, bridge, clock = world
+        _confirmed_boost(world)
+        ha.mode_override = "Boost"
+        _start_quota(api, clock)
+        clock.now += 60
+        bridge._run_poll_cycle()
+        posts = list(api.command_posts())
+        assert ha.run_handback(baseline_c=55) == "native_mode_unknown_stop"
+        assert ha.ownership is True and api.command_posts() == posts
+
+
 class TestStubbedEndToEnd:
     """Drives MyThermowattBridge.run() against a stub API over a scripted timeline."""
 
@@ -488,5 +636,8 @@ def test_templates_match_package19_when_available():
         ("{% set telemetry_fresh = poll_status == 'ok' and consecutive_poll_failures is not none "
          "and consecutive_poll_failures == 0 and last_poll_age_s is not none and last_poll_age_s <= 120 %}"),
         "{% set command_status_healthy = command_status in ['idle', 'confirmed'] %}",
+        GUARD_KNOWN_NON_MANUAL.removeprefix("{{ ").removesuffix(" }}"),
+        GUARD_NOT_MANUAL.removeprefix("{{ ").removesuffix(" }}"),
+        BRIDGE_ENTITY_USABLE.removeprefix("{{ ").removesuffix(" }}"),
     ):
         assert fragment in text
