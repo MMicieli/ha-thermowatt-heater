@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [1.8.0] - 2026-11-06 (release candidate; not released)
+
+See `docs/RELEASE-1.8.0.md` for the release notes, validation evidence, supervised commissioning checklist and rollback procedure.
+
 ### Fixed
 - **Rate-limit detection.** HTTP 429, and HTTP 200 bodies whose `error` is the confirmed `Daily request limit exceeded` message, are now recognised as rate limits. Previously only HTTP 429 was handled; the HTTP 200 form was counted as a generic invalid payload, so the bridge kept polling every 60 s (and fast-polling after commands) against an exhausted daily quota. Unrelated invalid payloads (for example `Water heater not found`) are still ordinary poll failures, not rate limits.
 - **Bounded exponential backoff.** On a rate limit all API requests stop for 120, 240, 480, 960, 1920 then at most 3600 s (a `Retry-After` header can lengthen, never shorten or exceed that ceiling). The window takes priority over the 60 s poll, command-triggered fast polling and poll wake-ups, and quota errors never trigger token refresh or re-login. A successful poll clears the backoff. Normal polling stays at 60 s.
@@ -34,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The request counters are per **UTC calendar day**, bridge-wide and in-memory between throttled flushes. They do **not** measure a rolling 24-hour quota and the vendor's reset instant is unknown; treat them as a relative indicator only. Requests made by the Thermowatt app or other clients are not counted.
 - Estimated HWS energy integrates `element_wattage x elapsed` only for a gap capped at 2x the 60 s poll interval. After a prolonged telemetry outage (rate limit, cloud or network) the uncounted heating time is **not** back-filled, so estimated energy can under-count.
 - While a rate-limit window is active the entity states are the last retained values; Package 19 must continue to use `last_successful_poll` age and `poll_status` rather than entity availability.
+
+### Build
+- Dockerfile now pins Python dependencies exactly (paho-mqtt 2.2.0, requests 2.34.2, urllib3 2.8.0, certifi 2026.10.23, idna 3.20, charset-normalizer 3.5.2) instead of ranges, so a Supervisor rebuild on the host reproduces the validated image.
 
 ### Unchanged (deliberately)
 - The immediate post-command poll is retained: no in-repo evidence establishes that it never confirms, and removing it without a replacement would leave the first confirmation poll up to 60 s away (the whole confirmation window). Revisit with the new latency diagnostics.
