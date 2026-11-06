@@ -1,0 +1,4 @@
+# Keep shell scripts and the add-on entrypoint LF on Windows checkouts (CRLF breaks the run.sh shebang).
+*.sh text eol=lf
+Dockerfile text eol=lf
+thermowatt-heater/run.sh text eol=lf

@@ -44,9 +44,17 @@ required user action).
 | Stubbed e2e, scenario A (real Mosquitto 2, TLS verification ON via private CA, stub API) | 60 s polls at t=0/60; HTTP-200 quota from t=90: poll at 120 s limited (window 120 s), poll at 240 s limited (window 240 s), **no API request between 120-240 and 240-480 s**; Off at t=150 and TEMP 50 at t=300 **refused locally, never sent**; recovery poll at 480 s; Eco at t=520 accepted, POST sent once, confirmed; exactly 1 login; clean SIGTERM exit code 0 |
 | Diagnostics lifecycle observed on the broker (A) | `none/ok` -> `active/rate_limited/rate_limited` (failures 1) -> `recovery_unverified` at window end (still `rate_limited`) -> `active` step 2 -> `recovery_unverified` -> `recovered/ok/fresh`; request counters sent 9, rate-limited responses 2, blocked 2 |
 | Stubbed e2e, scenario B (HTTP 429, restart inside window) | Persisted `rate_limit` step 1 written at SIGTERM; restarted container logged `Persisted backoff active — waiting 69s before any API request`; login at t=180 limited again -> `Step 3 deferred` (240 s) **without exiting** (RestartCount 0); login/discovery succeeded at t=420; recovery cleared on the first good poll |
-| Not covered | `run.sh` / bashio / Supervisor wiring (file unchanged vs `main`); real Thermowatt cloud; real HA; real HWS |
+| **Final smoke via the real entrypoint** (image `ENTRYPOINT /init` + `CMD /run.sh`, bashio, no `--entrypoint` override) | Stub Supervisor served `/addons/self/options/config` and `/services/mqtt` (bearer-token checked); Mosquitto with `allow_anonymous false` + password file; TLS verification on. Scenario A (HTTP-200 quota) **PASS**: 1 login, polls at 0/60, limited at 120 and 240 s, next request exactly at the 120 s / 240 s backoff, 2 commands refused locally, recovery poll at 480 s, one `POST /eco` at 520 s, states `none -> active -> recovery_unverified -> active -> recovery_unverified -> recovered`, exit 0. Scenario B (HTTP 429 + container restart in window) **PASS**: persisted step 1, second start waited 69 s, deferred login at 180 s without exiting, login at 420 s, RestartCount 0, exit 0. Logs scrubbed of credentials/e-mail; verified secret-free |
+| Harness assertions | `tests/e2e/verify_e2e.py` returns non-zero on unexpected API paths/calls, calls inside a window, wrong backoff spacing, extra/replayed command POSTs, re-login on quota, missing recovery transitions, wrong counters, leaked secrets, bad exit codes; 28 unit tests inject each violation (`tests/test_e2e_verifier.py`); live tamper check returned exit 1 |
+| Not covered | Real Supervisor/HA; real Thermowatt cloud; real HWS |
 
-Harness: `thermowatt-heater/tests/e2e/` (`run_e2e.sh A|B`, ~10 min each). Cosmetic note from the run: the poll warning
+Harness: `thermowatt-heater/tests/e2e/` (`build_image.sh`, then `run_e2e.sh A|B`, ~10 min each, exit status = verdict).
+
+**Finding from the smoke test (no production impact):** building the image from a Windows working tree with
+`core.autocrlf=true` gives `run.sh` CRLF endings and the container fails with `exec: fatal: unable to exec bashio`. The
+committed blob has LF endings (verified) and the Supervisor builds from a Linux clone, so production is unaffected;
+`git archive` also applies autocrlf, so `build_image.sh` builds from the raw blobs, and a root `.gitattributes` now pins
+`*.sh`, `Dockerfile` and `run.sh` to LF. Cosmetic note from the run: the poll warning
 reads `invalid device status payload (HTTP 200): rate limited: ...` (wording only).
 
 ### Rollback compatibility (checked)
@@ -139,4 +147,4 @@ Triggers: any **STOP** above; entities lost/renamed; polling not recovering; une
 ## 5. Outstanding deployment blockers
 1. Explicit operator approval to merge PR #16 and to update the installed add-on (neither done).
 2. A suitable maintenance window with ownership off and a verified pre-update backup (section 3.0/3.1).
-3. Not validated here: Supervisor/bashio wiring (`run.sh`), the real cloud's responses to quota, and the real device.
+3. Not validated here: a real Supervisor/HA (the entrypoint was exercised against a stub), the real cloud's responses to quota, and the real device.

@@ -36,7 +36,8 @@ class H(BaseHTTPRequestHandler):
             now = time.time() - T0
             path = self.path.split("/api/v1", 1)[-1]
             limited = LIMIT_FROM >= 0 and LIMIT_FROM <= now < LIMIT_UNTIL
-            log(m=self.command, p=path, limited=limited, body=body.decode()[:80])
+            log(m=self.command, p=path, limited=limited,
+                body="<redacted>" if path in ("/login", "/refresh") else body.decode()[:80])
             if limited:
                 if STYLE == "429":
                     return self._send(429, {"message": "Too many requests"})
