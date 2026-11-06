@@ -102,9 +102,12 @@ class TestDetection:
         r = _resp(200, {"success": False, "error": error})
         assert bridge._detect_rate_limit(r) == ("Daily request limit exceeded", None)
 
-    def test_daily_limit_without_success_key_detected(self, bridge):
-        r = _resp(200, {"error": "Daily request limit exceeded"})
-        assert bridge._detect_rate_limit(r) is not None
+    @pytest.mark.parametrize("success", [None, True, False, "false", 0])
+    def test_quota_message_detected_regardless_of_success_field(self, bridge, success):
+        body = {"error": "Daily request limit exceeded"}
+        if success is not None:
+            body["success"] = success
+        assert bridge._detect_rate_limit(_resp(200, body)) is not None
 
     @pytest.mark.parametrize("body", [
         {"success": False, "error": "Water heater not found, check the Wi-Fi connection"},
@@ -113,7 +116,6 @@ class TestDetection:
         {"success": False, "error": None},
         {"success": False, "error": 429},
         {"success": False, "error": ["Daily request limit exceeded"]},
-        {"success": True, "error": "Daily request limit exceeded"},
         {"result": {}},
         {},
         [],
@@ -187,7 +189,7 @@ class TestBackoff:
         bridge._enter_rate_limit("Daily request limit exceeded")
         assert bridge.rate_limit_backoff == 1
         assert bridge._rate_limit_events_total == 1
-        assert bridge._request_counters["rate_limited"] == 2
+        assert bridge._request_counters["rate_limited_responses"] == 2
 
     def test_normal_polling_interval_unchanged(self):
         assert MyThermowattBridge.POLL_INTERVAL == 60
@@ -225,7 +227,7 @@ class TestBackoff:
         bridge.login.assert_not_called()
 
     def test_repeated_limit_after_window_steps_up(self, bridge, clock):
-        bridge.request = MagicMock(return_value=_resp(200, DAILY))
+        bridge.request = MagicMock(side_effect=lambda *a, **k: _resp(200, DAILY))
         bridge._run_poll_cycle()
         clock.now += 121
         bridge._run_poll_cycle()
@@ -656,7 +658,7 @@ class TestObservability:
         raw = _published(bridge, "P/SN/diagnostics")[-1].args[1]
         d = json.loads(raw)
         assert set(d["rate_limit"]) == {"active", "retry_at", "backoff_step", "last_reason", "last_at", "events_total"}
-        assert {"status", "command", "auth", "other", "total", "rate_limited", "day"} <= set(d["requests"])
+        assert {"status", "command", "auth", "other", "total", "rate_limited_responses", "blocked", "day"} <= set(d["requests"])
         for secret in ("SECRET-ACCESS", "SECRET-REFRESH", bridge.API_KEY):
             assert secret not in raw
 

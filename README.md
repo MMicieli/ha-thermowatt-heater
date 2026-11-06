@@ -43,6 +43,17 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 
 > **Note:** `<name>` is the device name set in the MyThermowatt app. For a device named `HWS`, entity IDs will be `water_heater.hws_boiler_hws`, `binary_sensor.hws_hws_heating`, and corresponding `sensor.hws_hws_*` entities.
 
+## Rate limiting, diagnostics and handback visibility
+
+The Thermowatt cloud reports quota exhaustion either as HTTP 429 or as HTTP 200 with the error `Daily request limit exceeded`. On detection the bridge stops **all** API traffic (polls, token refresh, commands) for 120 s, doubling per consecutive event up to 3600 s; the window survives restarts, including during startup login/discovery. Normal polling stays at 60 s, the command cooldown at 15 s and the confirmation window at 60 s.
+
+- **Commands are never queued or replayed.** While a window is active a MODE/TEMP command is refused locally and recorded as `submit_failed` (`rate_limited: ...`). A command rejected by the API (including a 2xx body with the quota error or `success: false`) is `submit_failed`, never `pending`. After recovery nothing is re-sent; the next command must come from the caller.
+- **Diagnostics** (`P/<serial>/diagnostics`): `poll_status` is `rate_limited` from first detection until a good poll confirms recovery; `telemetry` = `{state, age_s, stale_after_s}`; `rate_limit` = `{active, retry_at, backoff_step, last_reason, last_at, events_total}`; `requests` = per-UTC-day counts of requests **sent** (`status`, `command`, `auth`, `other`, `total`), `rate_limited_responses` (responses classified as limited, once each) and `blocked` (refused locally, not in `total`).
+- **Counters are not a quota meter.** They are UTC-calendar-day, bridge-only counts, not a rolling 24-hour window, and the vendor's reset time is unknown.
+- **Estimated energy can under-count** after a prolonged telemetry outage: integration per poll gap is capped at twice the poll interval and the remainder is not back-filled.
+
+**Identifying an outstanding physical handback** (e.g. 70 C boost confirmed, then rate limited, then the baseline write failed): the durable evidence is `input_boolean.ems_hws_ownership_active = on`, which only a confirmed handback clears. The bridge side shows `sensor.<name>_<name>_command_status = submit_failed` with attribute `TEMP.requested` (50 or the baseline) and `TEMP.error` starting `rate_limited`, plus `Rate Limit Status = limited` and `poll_status = rate_limited`. A restart clears the in-memory command record; ownership remains on and Package 19's restart handback retries.
+
 ## Installation
 
 1. Install and start the **Mosquitto MQTT** broker add-on in Home Assistant.

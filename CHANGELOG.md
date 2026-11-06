@@ -15,8 +15,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **No command queue/replay.** While a rate-limit window is active, MODE/TEMP commands are refused locally (`submit_failed`, `rate_limited`), never queued and never replayed after recovery. Pending commands still expire on their normal 60 s deadline during a backoff.
 
 ### Added
-- Diagnostics: `rate_limit` (active, retry time, backoff step, last reason/time, lifetime events) and per-UTC-day `requests` counters (status/command/auth/other/total/rate_limited), exposed as `Rate Limit Status` and `API Requests (UTC day)` diagnostic sensors. Counters are persisted at most every 10 minutes and on shutdown. No tokens, credentials or API response bodies are published.
+- Diagnostics: `rate_limit` (active, retry time, backoff step, last reason/time, lifetime events) and per-UTC-day `requests` counters (status/command/auth/other/total/rate_limited_responses/blocked), exposed as `Rate Limit Status` and `API Requests (UTC day)` diagnostic sensors. Counters are persisted at most every 10 minutes and on shutdown. No tokens, credentials or API response bodies are published.
 - Command diagnostics gain `confirm_latency_s` and `confirm_poll_number` (which fresh poll first matched) to provide the evidence needed to decide whether the immediate post-command poll is worthwhile.
+
+### Review corrections (PR #16)
+- A successful poll that began before a newer rate-limit event (for example a command response handled on the MQTT thread) can no longer clear that event: backoff is cleared only by a poll whose request began after the latest classified rate-limit response, and never while a window is unexpired.
+- Rate-limit detection and command rejection now share one predicate: a body carrying the `Daily request limit exceeded` error is a quota rejection whether or not it has `success: false`, always starts the backoff, and can never create a `pending` command.
+- Startup login and `/user-info` discovery rate limits (including a window persisted from the previous run) are waited out in-process and retried instead of `exit(1)` and a supervisor restart loop. Other startup failures still exit; SIGTERM during the wait exits cleanly.
+- Each HTTP response is classified once (memoised on the response). Counter semantics: `status`/`command`/`auth`/`other` and `total` count requests actually sent; `rate_limited_responses` counts responses classified as a rate limit; `blocked` counts requests refused locally by an active window (never in `total`); `events_total` counts backoff windows.
+- `poll_status` reports `rate_limited` from the first detection until a good poll confirms recovery (any value other than `ok` keeps Package 19's `poll_status == 'ok'` freshness test fail-closed; `consecutive_poll_failures` still increments on the first detection and `last_successful_poll` age is unchanged). New `telemetry` diagnostics block (`state`: `fresh`/`stale`/`rate_limited`/`unknown`, `age_s`, `stale_after_s`; informational only) and diagnostics are republished at least once a minute during backoff so age and retry time stay current. No entity availability change.
+
+### Documented limitations
+- The request counters are per **UTC calendar day**, bridge-wide and in-memory between throttled flushes. They do **not** measure a rolling 24-hour quota and the vendor's reset instant is unknown; treat them as a relative indicator only. Requests made by the Thermowatt app or other clients are not counted.
+- Estimated HWS energy integrates `element_wattage x elapsed` only for a gap capped at 2x the 60 s poll interval. After a prolonged telemetry outage (rate limit, cloud or network) the uncounted heating time is **not** back-filled, so estimated energy can under-count.
+- While a rate-limit window is active the entity states are the last retained values; Package 19 must continue to use `last_successful_poll` age and `poll_status` rather than entity availability.
 
 ### Unchanged (deliberately)
 - The immediate post-command poll is retained: no in-repo evidence establishes that it never confirms, and removing it without a replacement would leave the first confirmation poll up to 60 s away (the whole confirmation window). Revisit with the new latency diagnostics.

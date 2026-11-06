@@ -127,6 +127,11 @@ class MyThermowattBridge:
     RATE_LIMIT_API_MESSAGE  = "daily request limit exceeded"  # matched case-insensitively
     COUNTER_FLUSH_INTERVAL  = 600   # seconds — max one request-counter config write per interval
     COMMAND_ERROR_MAX_LEN   = 120   # truncate API-supplied error text kept in diagnostics
+    # Informational only: age after which diagnostics label telemetry "stale". Mirrors
+    # Package 19's 120 s freshness test but does NOT replace it; Package 19 still
+    # evaluates poll_status / failures / last_successful_poll itself.
+    TELEMETRY_STALE_AFTER   = 120
+    DIAG_REFRESH_INTERVAL   = 60    # seconds — republish diagnostics during backoff (MQTT only)
 
     # CMD_COOLDOWN per command type — MODE and TEMP each have their own 15s window so a
     # valid paired sequence (MODE then TEMP, or vice versa) is never incorrectly blocked.
@@ -185,7 +190,8 @@ class MyThermowattBridge:
         self._rate_limit_until: float = 0.0
         self._rate_limit_reason = None
         self._rate_limit_last_at = None
-        self._rate_limit_events_total: int = 0
+        self._rate_limit_events_total: int = 0   # backoff windows started (lifetime)
+        self._rate_limit_generation: int = 0     # +1 per classified rate-limit response
         self._request_counters: dict = self._new_counters(self._utc_day())
         self._counters_dirty = False
         self._counters_last_flush: float = 0.0
@@ -228,8 +234,12 @@ class MyThermowattBridge:
 
     @staticmethod
     def _new_counters(day: str) -> dict:
+        # status/command/auth/other/total = HTTP requests actually SENT (total is
+        # their sum). rate_limited_responses = responses classified as a rate
+        # limit, counted once per response. blocked = requests refused locally by
+        # an active backoff window (never sent, never in `total`).
         return {"day": day, "status": 0, "command": 0, "auth": 0, "other": 0,
-                "total": 0, "rate_limited": 0}
+                "total": 0, "rate_limited_responses": 0, "blocked": 0}
 
     def _restore_persisted_state(self):
         """Restore rate-limit window and per-day request counters after a restart.
@@ -269,6 +279,9 @@ class MyThermowattBridge:
     def _raise_if_rate_limited(self):
         remaining = self._rate_limit_remaining()
         if remaining > 0:
+            with self._rate_limit_lock:
+                self._request_counters["blocked"] += 1
+                self._counters_dirty = True
             raise RateLimitedError(f"rate limited — no requests for {int(remaining)}s")
 
     @staticmethod
@@ -283,8 +296,11 @@ class MyThermowattBridge:
         """Return (reason, retry_after_s) when resp is a confirmed rate limit, else None.
 
         Recognised: HTTP 429, or a JSON object whose `error` is the confirmed
-        'Daily request limit exceeded' message and whose `success` is not true.
-        Any other invalid payload (e.g. 'Water heater not found') is NOT a rate limit.
+        'Daily request limit exceeded' message. The `success` flag is deliberately
+        ignored: a body carrying the quota message is never a clean success, and the
+        same predicate drives both backoff and command rejection so they cannot
+        disagree. Any other invalid payload (e.g. 'Water heater not found') is NOT
+        a rate limit.
         """
         if resp is None:
             return None
@@ -299,22 +315,37 @@ class MyThermowattBridge:
                     retry_after = None
             return "HTTP 429", retry_after
         body = self._json_body(resp)
-        if isinstance(body, dict) and body.get("success") is not True:
+        if isinstance(body, dict):
             error = body.get("error")
             if isinstance(error, str) and self.RATE_LIMIT_API_MESSAGE in error.strip().lower():
                 return "Daily request limit exceeded", None
         return None
 
     def _note_response(self, resp):
-        """Register a rate limit if resp is one. Safe to call repeatedly per response."""
+        """Classify resp once; register a rate limit event if it is one.
+
+        The verdict is memoised on the response object, so the same HTTP response
+        reaching request(), poll_status() and _submit_command() is counted and
+        registered exactly once. Returns True iff resp is a rate limit.
+        """
+        try:
+            cached = resp.__dict__.get("_tw_rate_limit_verdict")
+        except Exception:  # noqa: BLE001 - exotic response objects: classify, don't memoise
+            cached = None
+        if cached is not None:
+            return cached
         try:
             detected = self._detect_rate_limit(resp)
-        except Exception:
-            return False
-        if detected is None:
-            return False
-        self._enter_rate_limit(*detected)
-        return True
+        except Exception:  # noqa: BLE001
+            detected = None
+        verdict = detected is not None
+        try:
+            resp.__dict__["_tw_rate_limit_verdict"] = verdict
+        except Exception:  # noqa: BLE001
+            pass
+        if verdict:
+            self._enter_rate_limit(*detected)
+        return verdict
 
     def _enter_rate_limit(self, reason: str, retry_after=None):
         """Start (or extend a no-op into) a bounded exponential backoff window.
@@ -324,7 +355,8 @@ class MyThermowattBridge:
         """
         now = time.time()
         with self._rate_limit_lock:
-            self._request_counters["rate_limited"] += 1
+            self._request_counters["rate_limited_responses"] += 1
+            self._rate_limit_generation += 1
             self._counters_dirty = True
             self._rate_limit_last_at = self._isoformat_epoch(now)
             self._rate_limit_reason = reason
@@ -345,10 +377,24 @@ class MyThermowattBridge:
               "no requests or commands will be sent until the window ends")
         self._persist_rate_limit()
 
-    def _clear_rate_limit(self) -> bool:
-        """Reset backoff after a good poll. Returns True if a limit state was cleared."""
+    def _rate_limit_gen(self) -> int:
+        with self._rate_limit_lock:
+            return self._rate_limit_generation
+
+    def _clear_rate_limit(self, observed_generation=None) -> bool:
+        """Reset backoff after a good poll. Returns True if a limit state was cleared.
+
+        `observed_generation` is the rate-limit generation read BEFORE the poll
+        began. If any rate-limit response has been classified since (for example
+        from a command on the MQTT thread), the poll is older than that event and
+        must not clear it. An unexpired window is never cleared either.
+        """
         with self._rate_limit_lock:
             if self.rate_limit_backoff == 0 and self._rate_limit_until == 0.0:
+                return False
+            if observed_generation is not None and observed_generation != self._rate_limit_generation:
+                return False
+            if time.time() < self._rate_limit_until:
                 return False
             self.rate_limit_backoff = 0
             self._rate_limit_until = 0.0
@@ -451,14 +497,15 @@ class MyThermowattBridge:
             limited_for = self._rate_limit_remaining(now)
             if limited_for > 0:
                 end = max(end, now + limited_for)
-                timeout = limited_for
+                timeout = min(limited_for, self.DIAG_REFRESH_INTERVAL)
                 deadline = self._next_pending_deadline()
                 if deadline is not None:
                     timeout = min(timeout, max(deadline - now, 0.0) + 0.05)
                 if self._poll_wakeup.wait(timeout=timeout):
                     self._poll_wakeup.clear()  # discard — rate limit has priority
-                if deadline is not None and time.time() >= deadline:
-                    self._publish_all_diagnostics()  # expires + republishes pending
+                    continue
+                # Keep telemetry age / retry time / pending expiry current (MQTT only).
+                self._publish_all_diagnostics()
                 continue
             remaining = end - now
             if remaining <= 0:
@@ -1133,12 +1180,25 @@ class MyThermowattBridge:
         ts = self._last_successful_poll.get(serial)
         failures = self._consecutive_failures.get(serial, 0)
         command_status, commands = self._command_diagnostics(serial, now)
+        limited = self._rate_limit_snapshot()["step"] > 0  # until a good poll confirms recovery
+        if ts is None:
+            telemetry_state, age = "unknown", None
+        else:
+            age = round(max(0.0, now - ts), 1)
+            telemetry_state = "stale" if age > self.TELEMETRY_STALE_AFTER else "fresh"
+        if limited:
+            telemetry_state = "rate_limited"
+        degraded = failures >= self.DEGRADED_THRESHOLD
         payload = {
             "poll_interval":        self.current_poll_interval,
             "consecutive_failures": failures,
             "last_successful_poll": self._isoformat_epoch(ts),
             "element_wattage":      self.element_wattage,
-            "poll_status":          "degraded" if failures >= self.DEGRADED_THRESHOLD else "ok",
+            # "rate_limited" is anything-but-"ok", so Package 19's `poll_status == 'ok'`
+            # telemetry test stays fail-closed (and is now also visible to operators).
+            "poll_status":          "rate_limited" if limited else ("degraded" if degraded else "ok"),
+            "telemetry":            {"state": telemetry_state, "age_s": age,
+                                     "stale_after_s": self.TELEMETRY_STALE_AFTER},
             "last_poll_error":      self._last_poll_error.get(serial),
             "command_status":       command_status,
             "commands":             commands,
@@ -1361,11 +1421,15 @@ class MyThermowattBridge:
     def _command_rejection(self, resp):
         """Return a short reason when a 2xx command response is an API-level rejection.
 
-        Only an explicit JSON object with `success: false` is a rejection (the API
-        has been observed returning HTTP 200 with such a body). Body-less, non-JSON
+        A recognised quota error (with or without a `success` field) is always a
+        rejection and starts the backoff. Otherwise only an explicit JSON object
+        with `success: false` is a rejection (the API has been observed returning
+        HTTP 200 with such a body). Body-less, non-JSON
         or other JSON responses remain successful submissions, since several
         endpoints legitimately reply with an empty body.
         """
+        if self._note_response(resp):
+            return "rate_limited: Daily request limit exceeded"
         body = self._json_body(resp)
         if isinstance(body, dict) and body.get("success") is False:
             error = body.get("error")
@@ -1527,11 +1591,13 @@ class MyThermowattBridge:
             if self._rate_limit_remaining() > 0:
                 break  # rate limit has priority over normal polling
             self.poll_count += 1
+            generation = self._rate_limit_gen()  # before the request is sent
             success, status_code = self.poll_status(serial)
 
             if success:
                 self.success_count += 1
-                if self._clear_rate_limit():
+                if self._clear_rate_limit(generation):
+                    self._publish_diagnostics(serial)  # recovery visible immediately
                     self.current_poll_interval = (
                         self.POLL_INTERVAL_CONFIRM
                         if time.time() < self._confirm_until
@@ -1555,6 +1621,45 @@ class MyThermowattBridge:
         self.log_status_summary()
         self._maybe_flush_counters()
 
+    def _boot_authenticate_and_discover(self):
+        """Steps 3-4: login + device discovery, rate-limit aware.
+
+        A rate limit (persisted from a previous run, or hit right now by login or
+        /user-info) is waited out in-process and the step is retried once the
+        window ends, instead of exiting and letting the supervisor restart-loop
+        the add-on. Any other failure keeps the original fail-fast exit(1).
+        Waiting sends no requests; backoff windows keep doubling if the API is
+        still limiting, so total request rate stays bounded.
+        """
+        while True:
+            self._wait_out_persisted_rate_limit()
+
+            try:
+                self.login()
+                print("OK: Step 3 - Logged in to Thermowatt backend.")
+            except RateLimitedError as e:
+                print(f"[RATE LIMIT] Step 3 deferred: {e}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                print(f"FAILED: Step 3 - Backend authentication failed: {e}")
+                sys.exit(1)
+
+            try:
+                r = self.request("GET", "/user-info")
+                if self._note_response(r):
+                    raise RateLimitedError("device discovery rejected: rate limited")
+                devices = r.json().get('result', {}).get('termostati', [])
+                if not devices:
+                    raise Exception("Zero devices returned")  # noqa: TRY002
+                print(f"OK: Step 4 - Found {len(devices)} thermostats.")
+                return devices
+            except RateLimitedError as e:
+                print(f"[RATE LIMIT] Step 4 deferred: {e}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                print(f"FAILED: Step 4 - Could not retrieve thermostat list: {e}")
+                sys.exit(1)
+
     def run(self):
         print("--- BOOT SEQUENCE START ---")
 
@@ -1573,43 +1678,28 @@ class MyThermowattBridge:
             print(f"FAILED: Step 2 - MQTT Connection Error: {e}")
             sys.exit(1)
 
-        self._wait_out_persisted_rate_limit()
-
         try:
-            self.login()
-            print("OK: Step 3 - Logged in to Thermowatt backend.")
-        except Exception as e:
-            print(f"FAILED: Step 3 - Backend authentication failed: {e}")
-            sys.exit(1)
+            devices = self._boot_authenticate_and_discover()
+        except KeyboardInterrupt:
+            print("Stopping during startup...")
+            sys.exit(0)
 
-        try:
-            r       = self.request("GET", "/user-info")
-            devices = r.json().get('result', {}).get('termostati', [])
-            if not devices:
-                raise Exception("Zero devices returned")
+        for dev in devices:
+            serial = dev['seriale']
+            name   = dev.get('nome', 'Boiler')
 
-            print(f"OK: Step 4 - Found {len(devices)} thermostats.")
+            with self._config_lock:
+                if serial not in self.config['devices']:
+                    self.config['devices'][serial] = {"name": name, "last_setpoint": 60}
+                else:
+                    self.config['devices'][serial]["name"] = name
+                self._save_config()
 
-            for dev in devices:
-                serial = dev['seriale']
-                name   = dev.get('nome', 'Boiler')
-
-                with self._config_lock:
-                    if serial not in self.config['devices']:
-                        self.config['devices'][serial] = {"name": name, "last_setpoint": 60}
-                    else:
-                        self.config['devices'][serial]["name"] = name
-                    self._save_config()
-
-                # Publish per-device availability before discovery so sensors are not
-                # immediately unavailable between config publish and first poll.
-                self.mqtt_client.publish(f"P/{serial}/availability", "online", retain=True)
-                self.publish_discovery(serial, name)
-                print(f"🌉 Bridge active for: {name} ({serial})")
-
-        except Exception as e:
-            print(f"FAILED: Step 4 - Could not retrieve thermostat list: {e}")
-            sys.exit(1)
+            # Publish per-device availability before discovery so sensors are not
+            # immediately unavailable between config publish and first poll.
+            self.mqtt_client.publish(f"P/{serial}/availability", "online", retain=True)
+            self.publish_discovery(serial, name)
+            print(f"🌉 Bridge active for: {name} ({serial})")
 
         print(f"OK: Step 5 - Device discovery published. Element wattage: {self.element_wattage} W")
 
