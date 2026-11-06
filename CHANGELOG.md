@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.8.0] - 2026-11-06 (release candidate; not released)
+
+See `docs/RELEASE-1.8.0.md` for the release notes, validation evidence, supervised commissioning checklist and rollback procedure.
+
+### Fixed
+- **Rate-limit detection.** HTTP 429, and HTTP 200 bodies whose `error` is the confirmed `Daily request limit exceeded` message, are now recognised as rate limits. Previously only HTTP 429 was handled; the HTTP 200 form was counted as a generic invalid payload, so the bridge kept polling every 60 s (and fast-polling after commands) against an exhausted daily quota. Unrelated invalid payloads (for example `Water heater not found`) are still ordinary poll failures, not rate limits.
+- **Bounded exponential backoff.** On a rate limit all API requests stop for 120, 240, 480, 960, 1920 then at most 3600 s (a `Retry-After` header can lengthen, never shorten or exceed that ceiling). The window takes priority over the 60 s poll, command-triggered fast polling and poll wake-ups, and quota errors never trigger token refresh or re-login. A successful poll clears the backoff. Normal polling stays at 60 s.
+- **Restart persistence.** The backoff window and step are persisted (written only on transitions) and honoured on boot before any API request, so a restart loop cannot hammer an exhausted quota. Persisted values are validated and clamped.
+- **Command response validation.** A 2xx command response whose JSON body has `success: false` is now `submit_failed` (with a truncated reason), not `pending`, and does not start the confirmation window or consume the cooldown. Body-less and other 2xx responses remain successful submissions.
+- **No command queue/replay.** While a rate-limit window is active, MODE/TEMP commands are refused locally (`submit_failed`, `rate_limited`), never queued and never replayed after recovery. Pending commands still expire on their normal 60 s deadline during a backoff.
+
+### Added
+- Diagnostics: `rate_limit` (active, retry time, backoff step, last reason/time, lifetime events) and per-UTC-day `requests` counters (status/command/auth/other/total/rate_limited_responses/blocked), exposed as `Rate Limit Status` and `API Requests (UTC day)` diagnostic sensors. Counters are persisted at most every 10 minutes and on shutdown. No tokens, credentials or API response bodies are published.
+- Command diagnostics gain `confirm_latency_s` and `confirm_poll_number` (which fresh poll first matched) to provide the evidence needed to decide whether the immediate post-command poll is worthwhile.
+
+### Review corrections (PR #16)
+- A successful poll that began before a newer rate-limit event (for example a command response handled on the MQTT thread) can no longer clear that event: backoff is cleared only by a poll whose request began after the latest classified rate-limit response, and never while a window is unexpired.
+- Rate-limit detection and command rejection now share one predicate: a body carrying the `Daily request limit exceeded` error is a quota rejection whether or not it has `success: false`, always starts the backoff, and can never create a `pending` command.
+- Startup login and `/user-info` discovery rate limits (including a window persisted from the previous run) are waited out in-process and retried instead of `exit(1)` and a supervisor restart loop. Other startup failures still exit; SIGTERM during the wait exits cleanly.
+- Each HTTP response is classified once (memoised on the response). Counter semantics: `status`/`command`/`auth`/`other` and `total` count requests actually sent; `rate_limited_responses` counts responses classified as a rate limit; `blocked` counts requests refused locally by an active window (never in `total`); `events_total` counts backoff windows.
+- `poll_status` reports `rate_limited` from the first detection until a good poll confirms recovery (any value other than `ok` keeps Package 19's `poll_status == 'ok'` freshness test fail-closed; `consecutive_poll_failures` still increments on the first detection and `last_successful_poll` age is unchanged). New `telemetry` diagnostics block (`state`: `fresh`/`stale`/`rate_limited`/`unknown`, `age_s`, `stale_after_s`; informational only) and diagnostics are republished at least once a minute during backoff so age and retry time stay current. No entity availability change.
+
+### Final review amendment
+- `rate_limit.state` is now `none` / `active` / `recovery_unverified` / `recovered` (plus `recovered_at`); the `Rate Limit Status` sensor shows `limited`, `recovery_unverified` or `ok`, so it no longer reads `ok` between window expiry and the first successful poll. Diagnostics are republished when the window ends. Package 19 inputs are unchanged (`poll_status` stays `rate_limited` until recovery is verified).
+- Cross-system tests now cover both Package 19 ownership-release paths (confirmed baseline; native Off/Eco/Auto/Holiday at either guard, issuing no command) and the fail-closed unknown/unavailable/unrecognised-mode cases. Package 19 is not modified.
+- Documented: latched `command_status=submit_failed` and how it clears; that the restart-handback automation is a bounded attempt per Home Assistant start (not a recurring retry, not triggered by a bridge restart); and that "no replay" refers to rate-limit recovery. The existing HTTP 401 path re-sends the same request (including a command POST) once after a successful token refresh, within the same call; this is now tested (single replay, no third attempt, no replay on failed/rate-limited refresh) and commented in code.
+
+### Documented limitations
+- The request counters are per **UTC calendar day**, bridge-wide and in-memory between throttled flushes. They do **not** measure a rolling 24-hour quota and the vendor's reset instant is unknown; treat them as a relative indicator only. Requests made by the Thermowatt app or other clients are not counted.
+- Estimated HWS energy integrates `element_wattage x elapsed` only for a gap capped at 2x the 60 s poll interval. After a prolonged telemetry outage (rate limit, cloud or network) the uncounted heating time is **not** back-filled, so estimated energy can under-count.
+- While a rate-limit window is active the entity states are the last retained values; Package 19 must continue to use `last_successful_poll` age and `poll_status` rather than entity availability.
+
+### Build
+- Dockerfile now pins Python dependencies exactly (paho-mqtt 2.2.0, requests 2.34.2, urllib3 2.8.0, certifi 2026.10.23, idna 3.20, charset-normalizer 3.5.2) instead of ranges, so a Supervisor rebuild on the host reproduces the validated image.
+
+### Unchanged (deliberately)
+- The immediate post-command poll is retained: no in-repo evidence establishes that it never confirms, and removing it without a replacement would leave the first confirmation poll up to 60 s away (the whole confirmation window). Revisit with the new latency diagnostics.
+- 15 s command cooldown, 60 s confirmation window, 60 s normal polling and fresh-readback-only confirmation.
+
+---
+
 ## [1.7.3] - 2026-08-17
 
 ### Fixed

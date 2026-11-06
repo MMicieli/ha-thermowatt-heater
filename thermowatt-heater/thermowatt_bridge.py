@@ -69,6 +69,10 @@ KNOWN_CMD_FAMILIES = {
 }
 
 
+class RateLimitedError(Exception):
+    """Raised instead of sending an HTTP request while rate-limit backoff is active."""
+
+
 class MyThermowattBridge:
     API_KEY  = "YVjArWssxKH631jv1dnnWOTr6gijsSAGz7rQJ4hJoUNRffxYvbQaMbePBEZalena"
     BASE_URL = "https://myapp-connectivity.com/api/v1"
@@ -114,6 +118,21 @@ class MyThermowattBridge:
     TEMP_MIN = 20
     TEMP_MAX = 70  # matches confirmed T_set_max: 70 from device attributes
 
+    # Rate-limit handling. The API signals quota exhaustion either with HTTP 429 or
+    # with HTTP 200 and {"success": false, "error": "Daily request limit exceeded"}.
+    # Backoff doubles per consecutive rate-limit event: 120, 240, 480, 960, 1920 then
+    # capped at 3600 s. Normal polling stays at POLL_INTERVAL.
+    RATE_LIMIT_BASE_BACKOFF = 120   # seconds — first backoff step
+    RATE_LIMIT_MAX_BACKOFF  = 3600  # seconds — hard ceiling (also bounds Retry-After)
+    RATE_LIMIT_API_MESSAGE  = "daily request limit exceeded"  # matched case-insensitively
+    COUNTER_FLUSH_INTERVAL  = 600   # seconds — max one request-counter config write per interval
+    COMMAND_ERROR_MAX_LEN   = 120   # truncate API-supplied error text kept in diagnostics
+    # Informational only: age after which diagnostics label telemetry "stale". Mirrors
+    # Package 19's 120 s freshness test but does NOT replace it; Package 19 still
+    # evaluates poll_status / failures / last_successful_poll itself.
+    TELEMETRY_STALE_AFTER   = 120
+    DIAG_REFRESH_INTERVAL   = 60    # seconds — republish diagnostics during backoff (MQTT only)
+
     # CMD_COOLDOWN per command type — MODE and TEMP each have their own 15s window so a
     # valid paired sequence (MODE then TEMP, or vice versa) is never incorrectly blocked.
     CMD_COOLDOWN = 15  # seconds
@@ -146,7 +165,7 @@ class MyThermowattBridge:
         self.success_count         = 0
         self.error_count           = 0
         self.last_status_log_time  = time.time()
-        self.rate_limit_backoff    = 0  # 0=none, 1+=backoff steps
+        self.rate_limit_backoff    = 0  # 0=none, 1+=consecutive rate-limit backoff steps
         self.current_poll_interval = self.POLL_INTERVAL
 
         # Post-command fast-poll window tracking. The event wakes the poll loop so
@@ -163,6 +182,21 @@ class MyThermowattBridge:
 
         # Per-device last successful poll timestamp — for energy accumulation
         self._last_poll_ts: dict = {}  # {serial: epoch float}
+
+        # Rate-limit state. Guarded by _rate_limit_lock (never held across I/O). Lock
+        # order is _http_lock -> _rate_limit_lock; _config_lock is only taken after
+        # _rate_limit_lock has been released.
+        self._rate_limit_lock = threading.Lock()
+        self._rate_limit_until: float = 0.0
+        self._rate_limit_reason = None
+        self._rate_limit_last_at = None
+        self._rate_limit_recovered_at = None
+        self._rate_limit_events_total: int = 0   # backoff windows started (lifetime)
+        self._rate_limit_generation: int = 0     # +1 per classified rate-limit response
+        self._request_counters: dict = self._new_counters(self._utc_day())
+        self._counters_dirty = False
+        self._counters_last_flush: float = 0.0
+        self._restore_persisted_state()
 
         # Per-device degraded state tracking
         self._consecutive_failures: dict = {}  # {serial: int}
@@ -190,6 +224,328 @@ class MyThermowattBridge:
     def _save_config(self):
         with open(CONFIG_FILE, 'w') as f:
             json.dump(self.config, f)
+
+    # ------------------------------------------------------------------ #
+    #  Rate limiting + request counters                                    #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _utc_day() -> str:
+        return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _new_counters(day: str) -> dict:
+        # status/command/auth/other/total = HTTP requests actually SENT (total is
+        # their sum). rate_limited_responses = responses classified as a rate
+        # limit, counted once per response. blocked = requests refused locally by
+        # an active backoff window (never sent, never in `total`).
+        return {"day": day, "status": 0, "command": 0, "auth": 0, "other": 0,
+                "total": 0, "rate_limited_responses": 0, "blocked": 0}
+
+    def _restore_persisted_state(self):
+        """Restore rate-limit window and per-day request counters after a restart.
+
+        Only the backoff window/step and counters are restored — never any
+        command. A persisted window far beyond the ceiling (clock change or
+        corrupt file) is clamped so a bad value can never stall the bridge.
+        """
+        now = time.time()
+        try:
+            rl = self.config.get("rate_limit")
+            rl = rl if isinstance(rl, dict) else {}
+            until = float(rl.get("until") or 0.0)
+            self._rate_limit_until = min(until, now + self.RATE_LIMIT_MAX_BACKOFF)
+            self.rate_limit_backoff = max(0, int(rl.get("step") or 0))
+            self._rate_limit_reason = rl.get("reason")
+            self._rate_limit_last_at = rl.get("last_at")
+            self._rate_limit_recovered_at = rl.get("recovered_at")
+            self._rate_limit_events_total = max(0, int(rl.get("events_total") or 0))
+        except (TypeError, ValueError):
+            self._rate_limit_until, self.rate_limit_backoff = 0.0, 0
+        try:
+            saved = self.config.get("request_counters")
+            saved = saved if isinstance(saved, dict) else {}
+            if saved.get("day") == self._request_counters["day"]:
+                for key in self._request_counters:
+                    if key != "day":
+                        self._request_counters[key] = max(0, int(saved.get(key) or 0))
+        except (TypeError, ValueError):
+            pass
+
+    def _rate_limit_remaining(self, now=None) -> float:
+        """Seconds of rate-limit backoff left (0 when not limited)."""
+        now = time.time() if now is None else now
+        with self._rate_limit_lock:
+            return max(0.0, self._rate_limit_until - now)
+
+    def _raise_if_rate_limited(self):
+        remaining = self._rate_limit_remaining()
+        if remaining > 0:
+            with self._rate_limit_lock:
+                self._request_counters["blocked"] += 1
+                self._counters_dirty = True
+            raise RateLimitedError(f"rate limited — no requests for {int(remaining)}s")
+
+    @staticmethod
+    def _json_body(resp):
+        """Parsed JSON body or None. Body-less or non-JSON responses are normal."""
+        try:
+            return resp.json()
+        except Exception:
+            return None
+
+    def _detect_rate_limit(self, resp):
+        """Return (reason, retry_after_s) when resp is a confirmed rate limit, else None.
+
+        Recognised: HTTP 429, or a JSON object whose `error` is the confirmed
+        'Daily request limit exceeded' message. The `success` flag is deliberately
+        ignored: a body carrying the quota message is never a clean success, and the
+        same predicate drives both backoff and command rejection so they cannot
+        disagree. Any other invalid payload (e.g. 'Water heater not found') is NOT
+        a rate limit.
+        """
+        if resp is None:
+            return None
+        retry_after = None
+        if resp.status_code == 429:
+            headers = getattr(resp, "headers", None)
+            raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+            if isinstance(raw, (str, int, float)) and not isinstance(raw, bool):
+                try:
+                    retry_after = max(0.0, float(raw))
+                except ValueError:
+                    retry_after = None
+            return "HTTP 429", retry_after
+        body = self._json_body(resp)
+        if isinstance(body, dict):
+            error = body.get("error")
+            if isinstance(error, str) and self.RATE_LIMIT_API_MESSAGE in error.strip().lower():
+                return "Daily request limit exceeded", None
+        return None
+
+    def _note_response(self, resp):
+        """Classify resp once; register a rate limit event if it is one.
+
+        The verdict is memoised on the response object, so the same HTTP response
+        reaching request(), poll_status() and _submit_command() is counted and
+        registered exactly once. Returns True iff resp is a rate limit.
+        """
+        try:
+            cached = resp.__dict__.get("_tw_rate_limit_verdict")
+        except Exception:  # noqa: BLE001 - exotic response objects: classify, don't memoise
+            cached = None
+        if cached is not None:
+            return cached
+        try:
+            detected = self._detect_rate_limit(resp)
+        except Exception:  # noqa: BLE001
+            detected = None
+        verdict = detected is not None
+        try:
+            resp.__dict__["_tw_rate_limit_verdict"] = verdict
+        except Exception:  # noqa: BLE001
+            pass
+        if verdict:
+            self._enter_rate_limit(*detected)
+        return verdict
+
+    def _enter_rate_limit(self, reason: str, retry_after=None):
+        """Start (or extend a no-op into) a bounded exponential backoff window.
+
+        Only the first detection after a window has expired advances the step, so
+        concurrent detections from the poll and MQTT threads never double-step.
+        """
+        now = time.time()
+        with self._rate_limit_lock:
+            self._request_counters["rate_limited_responses"] += 1
+            self._rate_limit_generation += 1
+            self._counters_dirty = True
+            self._rate_limit_last_at = self._isoformat_epoch(now)
+            self._rate_limit_reason = reason
+            if now < self._rate_limit_until:
+                return
+            self.rate_limit_backoff += 1
+            self._rate_limit_events_total += 1
+            delay = min(
+                self.RATE_LIMIT_BASE_BACKOFF * 2 ** (self.rate_limit_backoff - 1),
+                self.RATE_LIMIT_MAX_BACKOFF,
+            )
+            if retry_after:
+                delay = min(max(delay, retry_after), self.RATE_LIMIT_MAX_BACKOFF)
+            self._rate_limit_until = now + delay
+            self.current_poll_interval = int(delay)
+            step = self.rate_limit_backoff
+        print(f"[RATE LIMIT] {reason} — backing off {int(delay)}s (step {step}); "
+              "no requests or commands will be sent until the window ends")
+        self._persist_rate_limit()
+
+    def _rate_limit_gen(self) -> int:
+        with self._rate_limit_lock:
+            return self._rate_limit_generation
+
+    def _clear_rate_limit(self, observed_generation=None) -> bool:
+        """Reset backoff after a good poll. Returns True if a limit state was cleared.
+
+        `observed_generation` is the rate-limit generation read BEFORE the poll
+        began. If any rate-limit response has been classified since (for example
+        from a command on the MQTT thread), the poll is older than that event and
+        must not clear it. An unexpired window is never cleared either.
+        """
+        with self._rate_limit_lock:
+            if self.rate_limit_backoff == 0 and self._rate_limit_until == 0.0:
+                return False
+            if observed_generation is not None and observed_generation != self._rate_limit_generation:
+                return False
+            if time.time() < self._rate_limit_until:
+                return False
+            self.rate_limit_backoff = 0
+            self._rate_limit_until = 0.0
+            self._rate_limit_recovered_at = self._isoformat_epoch(time.time())
+        self._persist_rate_limit()
+        print("[RATE LIMIT] Recovered — backoff cleared")
+        return True
+
+    def _rate_limit_snapshot(self) -> dict:
+        with self._rate_limit_lock:
+            return {
+                "until": self._rate_limit_until,
+                "step": self.rate_limit_backoff,
+                "reason": self._rate_limit_reason,
+                "last_at": self._rate_limit_last_at,
+                "recovered_at": self._rate_limit_recovered_at,
+                "events_total": self._rate_limit_events_total,
+            }
+
+    def _persist_rate_limit(self):
+        """Persist backoff state (written only on state transitions) plus counters."""
+        snap = self._rate_limit_snapshot()
+        try:
+            with self._config_lock:
+                self.config["rate_limit"] = snap
+                self._store_counters_locked()
+                self._save_config()
+        except Exception as e:
+            print(f"[WARN] Failed to persist rate-limit state: {e}")
+
+    def _store_counters_locked(self):
+        """Copy counters into config (caller holds _config_lock and saves)."""
+        with self._rate_limit_lock:
+            self.config["request_counters"] = dict(self._request_counters)
+            self._counters_dirty = False
+        self._counters_last_flush = time.time()
+
+    def _count_request(self, category: str):
+        today = self._utc_day()
+        with self._rate_limit_lock:
+            if self._request_counters["day"] != today:
+                self._request_counters = self._new_counters(today)
+            self._request_counters[category] += 1
+            self._request_counters["total"] += 1
+            self._counters_dirty = True
+
+    def _maybe_flush_counters(self, force: bool = False):
+        """Throttled counter persistence: at most one write per COUNTER_FLUSH_INTERVAL."""
+        with self._rate_limit_lock:
+            dirty = self._counters_dirty
+        if not dirty:
+            return
+        if not force and time.time() - self._counters_last_flush < self.COUNTER_FLUSH_INTERVAL:
+            return
+        try:
+            with self._config_lock:
+                self._store_counters_locked()
+                self._save_config()
+        except Exception as e:
+            print(f"[WARN] Failed to persist request counters: {e}")
+
+    def _rate_limit_diagnostics(self, now: float) -> dict:
+        snap = self._rate_limit_snapshot()
+        active = snap["until"] > now
+        # Three-way lifecycle (plus "none" before any event):
+        #   active               - backoff window running, no API traffic
+        #   recovery_unverified  - window over, but no successful poll has confirmed recovery
+        #   recovered            - a successful poll started after the last event cleared it
+        if snap["step"] > 0:
+            state = "active" if active else "recovery_unverified"
+        else:
+            state = "recovered" if snap["events_total"] > 0 else "none"
+        return {
+            "state": state,
+            "active": active,
+            "retry_at": self._isoformat_epoch(snap["until"]) if active else None,
+            "backoff_step": snap["step"],
+            "last_reason": snap["reason"],
+            "last_at": snap["last_at"],
+            "recovered_at": snap["recovered_at"],
+            "events_total": snap["events_total"],
+        }
+
+    def _next_pending_deadline(self):
+        """Earliest unexpired pending-command deadline across devices, or None."""
+        with self._command_lock:
+            deadlines = [
+                r["deadline"]
+                for records in self._command_state.values()
+                for r in records.values()
+                if r.get("status") == "pending"
+            ]
+        return min(deadlines) if deadlines else None
+
+    def _publish_all_diagnostics(self):
+        with self._config_lock:
+            serials = list(self.config.get("devices", {}).keys())
+        for serial in serials:
+            self._publish_diagnostics(serial)
+
+    def _wait_for_next_poll(self, interval: float):
+        """Sleep until the next poll is due.
+
+        A command wake-up ends the wait early ONLY when no rate-limit window is
+        active; while limited, wake-ups are discarded so neither the 60 s poll,
+        command-triggered fast polling nor a stale wake can reach the API early.
+        Pending commands are still expired (and republished) on their deadline.
+        """
+        end = time.time() + interval
+        was_limited = False
+        while True:
+            now = time.time()
+            limited_for = self._rate_limit_remaining(now)
+            if limited_for <= 0 and was_limited:
+                was_limited = False
+                self._publish_all_diagnostics()  # window over: show recovery_unverified now
+            if limited_for > 0:
+                was_limited = True
+                end = max(end, now + limited_for)
+                timeout = min(limited_for, self.DIAG_REFRESH_INTERVAL)
+                deadline = self._next_pending_deadline()
+                if deadline is not None:
+                    timeout = min(timeout, max(deadline - now, 0.0) + 0.05)
+                if self._poll_wakeup.wait(timeout=timeout):
+                    self._poll_wakeup.clear()  # discard — rate limit has priority
+                    continue
+                # Keep telemetry age / retry time / pending expiry current (MQTT only).
+                self._publish_all_diagnostics()
+                continue
+            remaining = end - now
+            if remaining <= 0:
+                return
+            if self._poll_wakeup.wait(timeout=remaining):
+                if self._rate_limit_remaining() > 0:
+                    continue  # limit began while waiting — re-evaluate
+                return
+
+    def _wait_out_persisted_rate_limit(self):
+        """On boot, honour a backoff window persisted by the previous run."""
+        remaining = self._rate_limit_remaining()
+        if remaining <= 0:
+            return
+        print(f"[RATE LIMIT] Persisted backoff active — waiting {int(remaining)}s before any API request")
+        self._publish_all_diagnostics()
+        while True:
+            remaining = self._rate_limit_remaining()
+            if remaining <= 0:
+                break
+            time.sleep(min(remaining, 30))
 
     # ------------------------------------------------------------------ #
     #  HTTP session helpers                                                #
@@ -222,20 +578,28 @@ class MyThermowattBridge:
 
     def login(self):
         with self._http_lock:
+            self._raise_if_rate_limited()
             self._reset_headers()
             self.session.headers["x-api-key"] = self.API_KEY
             payload = {"username": EMAIL, "password": PASSWORD, "device_id": self.config["device_uuid"]}
+            self._count_request("auth")
             r = self.session.post(f"{self.BASE_URL}/login", json=payload, verify=TLS_VERIFY, timeout=HTTP_TIMEOUT)
+            if self._note_response(r):
+                raise RateLimitedError("login rejected: rate limited")
             r.raise_for_status()
             res = r.json()['result']
             self._update_auth(res['accessToken'], res['refreshToken'])
 
     def refresh_session(self):
         with self._http_lock:
+            self._raise_if_rate_limited()
             self._reset_headers()
             self.session.headers["x-api-key"] = self.API_KEY
             payload = {"username": EMAIL, "refreshToken": self.config["refresh_token"]}
+            self._count_request("auth")
             r = self.session.post(f"{self.BASE_URL}/refresh", json=payload, verify=TLS_VERIFY, timeout=HTTP_TIMEOUT)
+            if self._note_response(r):
+                raise RateLimitedError("token refresh rejected: rate limited")
             if r.status_code == 200:
                 res = r.json()['result']
                 self._update_auth(res['accessToken'], res['refreshToken'])
@@ -244,18 +608,37 @@ class MyThermowattBridge:
 
     def request(self, method, endpoint, serial=None, **kwargs):
         with self._http_lock:
+            # Fail closed before any I/O while a rate-limit window is active.
+            self._raise_if_rate_limited()
+            category = (
+                "status" if endpoint == "/status"
+                else "command" if method.upper() == "POST"
+                else "other"
+            )
             self._reset_headers()
             url = f"{self.BASE_URL}{endpoint}"
             if serial:
                 self.session.headers["seriale"] = serial
             kwargs.setdefault("timeout", HTTP_TIMEOUT)
+            self._count_request(category)
             resp = self.session.request(method, url, verify=TLS_VERIFY, **kwargs)
+            if self._note_response(resp):
+                return resp  # quota errors never trigger re-authentication
             if resp.status_code == 401:
+                # Pre-existing, bounded auth replay (unrelated to rate-limit recovery):
+                # on HTTP 401 the token is refreshed and the SAME request - including a
+                # command POST with identical body - is re-sent exactly once, inside this
+                # call. A 401 is an authentication refusal, so the first attempt is
+                # assumed not to have been executed (vendor behaviour unverified). A
+                # second 401, a failed refresh or a rate limit ends the call; there is no
+                # loop, queue or later re-send.
                 if self.refresh_session():
                     self._reset_headers()
                     if serial:
                         self.session.headers["seriale"] = serial
+                    self._count_request(category)
                     resp = self.session.request(method, url, verify=TLS_VERIFY, **kwargs)
+                    self._note_response(resp)
             return resp
 
     # ------------------------------------------------------------------ #
@@ -592,6 +975,32 @@ class MyThermowattBridge:
                 "slug":            "poll_status",
             },
             {
+                "unique_id":                f"thermowatt_{serial}_rate_limit_status",
+                "name":                     f"{name} Rate Limit Status",
+                "state_topic":              diag_topic,
+                "value_template":           (
+                    "{{ {'active': 'limited', 'recovery_unverified': 'recovery_unverified'}"
+                    ".get(value_json.rate_limit.state, 'ok') }}"
+                ),
+                "json_attributes_topic":    diag_topic,
+                "json_attributes_template": "{{ value_json.rate_limit | tojson }}",
+                "entity_category":          "diagnostic",
+                "icon":                     "mdi:speedometer-slow",
+                "slug":                     "rate_limit_status",
+            },
+            {
+                "unique_id":                f"thermowatt_{serial}_api_requests",
+                "name":                     f"{name} API Requests (UTC day)",
+                "state_topic":              diag_topic,
+                "value_template":           "{{ value_json.requests.total | int }}",
+                "state_class":              "measurement",
+                "json_attributes_topic":    diag_topic,
+                "json_attributes_template": "{{ value_json.requests | tojson }}",
+                "entity_category":          "diagnostic",
+                "icon":                     "mdi:counter",
+                "slug":                     "api_requests",
+            },
+            {
                 "unique_id":                f"thermowatt_{serial}_command_status",
                 "name":                     f"{name} Command Status",
                 "state_topic":              diag_topic,
@@ -728,12 +1137,18 @@ class MyThermowattBridge:
 
                 observed = result.get(record["field"])
                 record["fresh_poll_seen"] = True
+                record["polls_seen"] = record.get("polls_seen", 0) + 1
                 record["observed"] = observed
                 record["checked_at"] = now
 
                 if self._command_value_matches(record["field"], observed, record["requested"]):
                     record["status"] = "confirmed"
                     record["completed_at"] = now
+                    # Evidence for deciding whether the immediate post-command poll
+                    # is ever useful: seconds from submission to first matching
+                    # readback, and which fresh poll (1 = the immediate one) matched.
+                    record["confirm_latency_s"] = round(now - record["submitted_at"], 1)
+                    record["confirm_poll_number"] = record["polls_seen"]
                     if record["field"] == "T_SetPoint":
                         confirmed_setpoint = observed
                     print(
@@ -773,9 +1188,20 @@ class MyThermowattBridge:
                     "checked_at": self._isoformat_epoch(record.get("checked_at")),
                     "completed_at": self._isoformat_epoch(record.get("completed_at")),
                     "fresh_poll_seen": bool(record.get("fresh_poll_seen")),
+                    "confirm_latency_s": record.get("confirm_latency_s"),
+                    "confirm_poll_number": record.get("confirm_poll_number"),
                     "error": record.get("error"),
                 }
             return summary, serialised
+
+    def _requests_diagnostics(self) -> dict:
+        """Per-UTC-day API request counters (bridge-wide; counts, no payload data)."""
+        today = self._utc_day()
+        with self._rate_limit_lock:
+            counters = dict(self._request_counters)
+        if counters["day"] != today:
+            counters = self._new_counters(today)
+        return counters
 
     def _publish_diagnostics(self, serial: str):
         """Publish bridge, poll-health and command-confirmation diagnostics."""
@@ -783,15 +1209,30 @@ class MyThermowattBridge:
         ts = self._last_successful_poll.get(serial)
         failures = self._consecutive_failures.get(serial, 0)
         command_status, commands = self._command_diagnostics(serial, now)
+        limited = self._rate_limit_snapshot()["step"] > 0  # until a good poll confirms recovery
+        if ts is None:
+            telemetry_state, age = "unknown", None
+        else:
+            age = round(max(0.0, now - ts), 1)
+            telemetry_state = "stale" if age > self.TELEMETRY_STALE_AFTER else "fresh"
+        if limited:
+            telemetry_state = "rate_limited"
+        degraded = failures >= self.DEGRADED_THRESHOLD
         payload = {
             "poll_interval":        self.current_poll_interval,
             "consecutive_failures": failures,
             "last_successful_poll": self._isoformat_epoch(ts),
             "element_wattage":      self.element_wattage,
-            "poll_status":          "degraded" if failures >= self.DEGRADED_THRESHOLD else "ok",
+            # "rate_limited" is anything-but-"ok", so Package 19's `poll_status == 'ok'`
+            # telemetry test stays fail-closed (and is now also visible to operators).
+            "poll_status":          "rate_limited" if limited else ("degraded" if degraded else "ok"),
+            "telemetry":            {"state": telemetry_state, "age_s": age,
+                                     "stale_after_s": self.TELEMETRY_STALE_AFTER},
             "last_poll_error":      self._last_poll_error.get(serial),
             "command_status":       command_status,
             "commands":             commands,
+            "rate_limit":           self._rate_limit_diagnostics(now),
+            "requests":             self._requests_diagnostics(),
         }
         try:
             self.mqtt_client.publish(f"P/{serial}/diagnostics", json.dumps(payload), retain=True)
@@ -804,11 +1245,14 @@ class MyThermowattBridge:
             poll_started_at = time.time()
             r           = self.request("GET", "/status", serial=serial)
             status_code = r.status_code
+            self._note_response(r)  # idempotent; covers a mocked/wrapped request()
 
             if status_code == 200:
                 status_data = r.json()
                 is_valid, invalid_reason = self._validate_status_payload(status_data)
                 if not is_valid:
+                    if self._detect_rate_limit(r) is not None:
+                        invalid_reason = "rate limited: Daily request limit exceeded"
                     # HTTP 200 with no usable device status — count it as a poll
                     # failure using the existing failure/threshold machinery, not
                     # as fresh state. Never falls through to STATUS publish,
@@ -959,9 +1403,23 @@ class MyThermowattBridge:
     def _submit_command(
         self, serial: str, cmd_type: str, field: str, requested, endpoint: str, **kwargs
     ) -> bool:
-        """Submit once, then record either pending confirmation or submit_failed."""
+        """Submit once, then record either pending confirmation or submit_failed.
+
+        Never queues, and never re-sends after rate-limit recovery: a command refused
+        locally (rate-limit window), rejected by the API, or failed in transport is
+        surfaced as submit_failed. The single exception is request()'s pre-existing
+        one-shot replay of the same POST after a successful HTTP 401 token refresh
+        (see request()); it happens inside this one call, never later.
+        """
         try:
             resp = self.request("POST", endpoint, serial=serial, **kwargs)
+        except RateLimitedError as e:
+            self._record_submission_failure(serial, cmd_type, field, requested, f"rate_limited: {e}")
+            print(
+                f"[ERROR] {serial}/{cmd_type} command NOT sent ({e}) — "
+                "not queued; confirmed state unchanged"
+            )
+            return False
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             self._record_submission_failure(serial, cmd_type, field, requested, error)
@@ -972,8 +1430,16 @@ class MyThermowattBridge:
             return False
 
         if resp is not None and 200 <= resp.status_code < 300:
-            self._record_command(serial, cmd_type, field, requested)
-            return True
+            rejection = self._command_rejection(resp)
+            if rejection is None:
+                self._record_command(serial, cmd_type, field, requested)
+                return True
+            self._record_submission_failure(serial, cmd_type, field, requested, rejection)
+            print(
+                f"[ERROR] {serial}/{cmd_type} command rejected by API despite HTTP "
+                f"{resp.status_code} ({rejection}) — confirmed state unchanged"
+            )
+            return False
 
         code = resp.status_code if resp is not None else "no response"
         self._record_submission_failure(serial, cmd_type, field, requested, code)
@@ -982,6 +1448,25 @@ class MyThermowattBridge:
             "confirmed state unchanged"
         )
         return False
+
+    def _command_rejection(self, resp):
+        """Return a short reason when a 2xx command response is an API-level rejection.
+
+        A recognised quota error (with or without a `success` field) is always a
+        rejection and starts the backoff. Otherwise only an explicit JSON object
+        with `success: false` is a rejection (the API has been observed returning
+        HTTP 200 with such a body). Body-less, non-JSON
+        or other JSON responses remain successful submissions, since several
+        endpoints legitimately reply with an empty body.
+        """
+        if self._note_response(resp):
+            return "rate_limited: Daily request limit exceeded"
+        body = self._json_body(resp)
+        if isinstance(body, dict) and body.get("success") is False:
+            error = body.get("error")
+            detail = error if isinstance(error, str) and error.strip() else "success=false"
+            return f"API rejected: {detail.strip()[:self.COMMAND_ERROR_MAX_LEN]}"
+        return None
 
     def on_mqtt_message(self, client, userdata, msg):
         """Local HA → REST API command handler."""
@@ -1114,6 +1599,98 @@ class MyThermowattBridge:
     #  Boot + main loop                                                    #
     # ------------------------------------------------------------------ #
 
+    def _run_poll_cycle(self):
+        """One poll pass over all devices (no waiting). Rate limit takes priority."""
+        # Clear at the start of the cycle. A command arriving during polling
+        # or the following wait remains set and wakes the next eligible poll.
+        self._poll_wakeup.clear()
+
+        if self._rate_limit_remaining() <= 0 and self.current_poll_interval > self.POLL_INTERVAL:
+            # Backoff window ended: the stretched interval was only for the window.
+            self.current_poll_interval = self.POLL_INTERVAL
+
+        # Exit fast-poll window once confirm period has elapsed
+        if self.current_poll_interval == self.POLL_INTERVAL_CONFIRM:
+            if time.time() >= self._confirm_until:
+                self.current_poll_interval = self.POLL_INTERVAL
+                print(f"[POLL] Confirmation window closed — resuming normal polling ({self.POLL_INTERVAL}s)")
+
+        with self._config_lock:
+            device_serials = list(self.config.get('devices', {}).keys())
+
+        for serial in device_serials:
+            if self._rate_limit_remaining() > 0:
+                break  # rate limit has priority over normal polling
+            self.poll_count += 1
+            generation = self._rate_limit_gen()  # before the request is sent
+            success, status_code = self.poll_status(serial)
+
+            if success:
+                self.success_count += 1
+                if self._clear_rate_limit(generation):
+                    self._publish_diagnostics(serial)  # recovery visible immediately
+                    self.current_poll_interval = (
+                        self.POLL_INTERVAL_CONFIRM
+                        if time.time() < self._confirm_until
+                        else self.POLL_INTERVAL
+                    )
+            else:
+                self.error_count += 1
+                if self._rate_limit_remaining() > 0:
+                    # Quota errors never trigger re-authentication; the
+                    # backoff window (already registered) gates all I/O.
+                    print(f"[RATE LIMIT] {serial} rate limited, next request in "
+                          f"{int(self._rate_limit_remaining())}s")
+                    break
+                elif status_code is not None:
+                    print(f"[ERROR] Got status {status_code} for {serial}, re-logging in...")
+                    try:
+                        self.login()
+                    except Exception as e:
+                        print(f"[ERROR] Re-login failed: {e}")
+
+        self.log_status_summary()
+        self._maybe_flush_counters()
+
+    def _boot_authenticate_and_discover(self):
+        """Steps 3-4: login + device discovery, rate-limit aware.
+
+        A rate limit (persisted from a previous run, or hit right now by login or
+        /user-info) is waited out in-process and the step is retried once the
+        window ends, instead of exiting and letting the supervisor restart-loop
+        the add-on. Any other failure keeps the original fail-fast exit(1).
+        Waiting sends no requests; backoff windows keep doubling if the API is
+        still limiting, so total request rate stays bounded.
+        """
+        while True:
+            self._wait_out_persisted_rate_limit()
+
+            try:
+                self.login()
+                print("OK: Step 3 - Logged in to Thermowatt backend.")
+            except RateLimitedError as e:
+                print(f"[RATE LIMIT] Step 3 deferred: {e}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                print(f"FAILED: Step 3 - Backend authentication failed: {e}")
+                sys.exit(1)
+
+            try:
+                r = self.request("GET", "/user-info")
+                if self._note_response(r):
+                    raise RateLimitedError("device discovery rejected: rate limited")
+                devices = r.json().get('result', {}).get('termostati', [])
+                if not devices:
+                    raise Exception("Zero devices returned")  # noqa: TRY002
+                print(f"OK: Step 4 - Found {len(devices)} thermostats.")
+                return devices
+            except RateLimitedError as e:
+                print(f"[RATE LIMIT] Step 4 deferred: {e}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                print(f"FAILED: Step 4 - Could not retrieve thermostat list: {e}")
+                sys.exit(1)
+
     def run(self):
         print("--- BOOT SEQUENCE START ---")
 
@@ -1133,40 +1710,27 @@ class MyThermowattBridge:
             sys.exit(1)
 
         try:
-            self.login()
-            print("OK: Step 3 - Logged in to Thermowatt backend.")
-        except Exception as e:
-            print(f"FAILED: Step 3 - Backend authentication failed: {e}")
-            sys.exit(1)
+            devices = self._boot_authenticate_and_discover()
+        except KeyboardInterrupt:
+            print("Stopping during startup...")
+            sys.exit(0)
 
-        try:
-            r       = self.request("GET", "/user-info")
-            devices = r.json().get('result', {}).get('termostati', [])
-            if not devices:
-                raise Exception("Zero devices returned")
+        for dev in devices:
+            serial = dev['seriale']
+            name   = dev.get('nome', 'Boiler')
 
-            print(f"OK: Step 4 - Found {len(devices)} thermostats.")
+            with self._config_lock:
+                if serial not in self.config['devices']:
+                    self.config['devices'][serial] = {"name": name, "last_setpoint": 60}
+                else:
+                    self.config['devices'][serial]["name"] = name
+                self._save_config()
 
-            for dev in devices:
-                serial = dev['seriale']
-                name   = dev.get('nome', 'Boiler')
-
-                with self._config_lock:
-                    if serial not in self.config['devices']:
-                        self.config['devices'][serial] = {"name": name, "last_setpoint": 60}
-                    else:
-                        self.config['devices'][serial]["name"] = name
-                    self._save_config()
-
-                # Publish per-device availability before discovery so sensors are not
-                # immediately unavailable between config publish and first poll.
-                self.mqtt_client.publish(f"P/{serial}/availability", "online", retain=True)
-                self.publish_discovery(serial, name)
-                print(f"🌉 Bridge active for: {name} ({serial})")
-
-        except Exception as e:
-            print(f"FAILED: Step 4 - Could not retrieve thermostat list: {e}")
-            sys.exit(1)
+            # Publish per-device availability before discovery so sensors are not
+            # immediately unavailable between config publish and first poll.
+            self.mqtt_client.publish(f"P/{serial}/availability", "online", retain=True)
+            self.publish_discovery(serial, name)
+            print(f"🌉 Bridge active for: {name} ({serial})")
 
         print(f"OK: Step 5 - Device discovery published. Element wattage: {self.element_wattage} W")
 
@@ -1177,62 +1741,22 @@ class MyThermowattBridge:
 
         while True:
             try:
-                # Clear at the start of the cycle. A command arriving during polling
-                # or the following wait remains set and wakes the next eligible poll.
-                self._poll_wakeup.clear()
-
-                # Exit fast-poll window once confirm period has elapsed
-                if self.current_poll_interval == self.POLL_INTERVAL_CONFIRM:
-                    if time.time() >= self._confirm_until:
-                        self.current_poll_interval = self.POLL_INTERVAL
-                        print(f"[POLL] Confirmation window closed — resuming normal polling ({self.POLL_INTERVAL}s)")
-
-                with self._config_lock:
-                    device_serials = list(self.config.get('devices', {}).keys())
-
-                for serial in device_serials:
-                    self.poll_count += 1
-                    success, status_code = self.poll_status(serial)
-
-                    if success:
-                        self.success_count += 1
-                        if self.rate_limit_backoff > 0:
-                            self.rate_limit_backoff = 0
-                            self.current_poll_interval = (
-                                self.POLL_INTERVAL_CONFIRM
-                                if time.time() < self._confirm_until
-                                else self.POLL_INTERVAL
-                            )
-                    else:
-                        self.error_count += 1
-                        if status_code == 429:
-                            self.rate_limit_backoff += 1
-                            backoff_interval = min(60 * (self.rate_limit_backoff + 1), 180)
-                            self.current_poll_interval = backoff_interval
-                            print(f"[RATE LIMIT] 429 from {serial}, backing off to {self.current_poll_interval}s")
-                            # continue — don't skip remaining devices; each has its own serial.
-                            # The backoff sleep below applies to the whole next iteration.
-                            continue
-                        elif status_code is not None:
-                            print(f"[ERROR] Got status {status_code} for {serial}, re-logging in...")
-                            try:
-                                self.login()
-                            except Exception as e:
-                                print(f"[ERROR] Re-login failed: {e}")
-
-                self.log_status_summary()
-                self._poll_wakeup.wait(timeout=self.current_poll_interval)
+                self._run_poll_cycle()
+                self._wait_for_next_poll(self.current_poll_interval)
 
             except KeyboardInterrupt:
                 print("Stopping...")
                 break
             except Exception as e:
                 print(f"[ERROR] Polling loop error: {e}")
-                try:
-                    self.login()
-                except Exception as e2:
-                    print(f"[ERROR] Re-login failed: {e2}")
-                self._poll_wakeup.wait(timeout=self.current_poll_interval)
+                if self._rate_limit_remaining() <= 0:
+                    try:
+                        self.login()
+                    except Exception as e2:
+                        print(f"[ERROR] Re-login failed: {e2}")
+                self._wait_for_next_poll(self.current_poll_interval)
+
+        self._maybe_flush_counters(force=True)
 
         # Explicitly publish offline on clean shutdown.
         # LWT fires on unclean disconnect only; this covers clean add-on stop/restart.
