@@ -14,6 +14,7 @@ This add-on bridges Thermowatt-based smart water heaters into Home Assistant via
 - **Stale Data Protection**: `last_polled_at` advances only after a successful device-status poll
 - **Command Confirmation**: HTTP success means submitted, not applied; MODE and TEMP remain pending until confirmed by newer device readback
 - **Power & Energy Monitoring**: Configurable heating-state power estimate plus accumulated estimated energy persisted across restarts
+- **Rate-Limit Protection**: HTTP 429 and the API's `Daily request limit exceeded` response pause all requests with bounded exponential backoff (120 s up to 1 h), persisted across restarts. Commands are refused (never queued or replayed) while paused; `Rate Limit Status` and `API Requests (UTC day)` diagnostics show the state
 - **Safety Hardening**: Temperature clamp (20–70°C), retained-command rejection, bounded confirmation, HTTP timeouts and clean shutdown
 
 ## Entities Created

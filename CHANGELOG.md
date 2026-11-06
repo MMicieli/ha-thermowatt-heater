@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Rate-limit detection.** HTTP 429, and HTTP 200 bodies whose `error` is the confirmed `Daily request limit exceeded` message, are now recognised as rate limits. Previously only HTTP 429 was handled; the HTTP 200 form was counted as a generic invalid payload, so the bridge kept polling every 60 s (and fast-polling after commands) against an exhausted daily quota. Unrelated invalid payloads (for example `Water heater not found`) are still ordinary poll failures, not rate limits.
+- **Bounded exponential backoff.** On a rate limit all API requests stop for 120, 240, 480, 960, 1920 then at most 3600 s (a `Retry-After` header can lengthen, never shorten or exceed that ceiling). The window takes priority over the 60 s poll, command-triggered fast polling and poll wake-ups, and quota errors never trigger token refresh or re-login. A successful poll clears the backoff. Normal polling stays at 60 s.
+- **Restart persistence.** The backoff window and step are persisted (written only on transitions) and honoured on boot before any API request, so a restart loop cannot hammer an exhausted quota. Persisted values are validated and clamped.
+- **Command response validation.** A 2xx command response whose JSON body has `success: false` is now `submit_failed` (with a truncated reason), not `pending`, and does not start the confirmation window or consume the cooldown. Body-less and other 2xx responses remain successful submissions.
+- **No command queue/replay.** While a rate-limit window is active, MODE/TEMP commands are refused locally (`submit_failed`, `rate_limited`), never queued and never replayed after recovery. Pending commands still expire on their normal 60 s deadline during a backoff.
+
+### Added
+- Diagnostics: `rate_limit` (active, retry time, backoff step, last reason/time, lifetime events) and per-UTC-day `requests` counters (status/command/auth/other/total/rate_limited), exposed as `Rate Limit Status` and `API Requests (UTC day)` diagnostic sensors. Counters are persisted at most every 10 minutes and on shutdown. No tokens, credentials or API response bodies are published.
+- Command diagnostics gain `confirm_latency_s` and `confirm_poll_number` (which fresh poll first matched) to provide the evidence needed to decide whether the immediate post-command poll is worthwhile.
+
+### Unchanged (deliberately)
+- The immediate post-command poll is retained: no in-repo evidence establishes that it never confirms, and removing it without a replacement would leave the first confirmation poll up to 60 s away (the whole confirmation window). Revisit with the new latency diagnostics.
+- 15 s command cooldown, 60 s confirmation window, 60 s normal polling and fresh-readback-only confirmation.
+
 ---
 
 ## [1.7.3] - 2026-08-17
