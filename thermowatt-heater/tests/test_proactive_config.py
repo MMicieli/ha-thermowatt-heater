@@ -1,6 +1,5 @@
 """Configuration contract for the proactive-refresh switch (issue #17), no Supervisor needed."""
 
-import importlib
 import os
 import re
 import sys
@@ -12,13 +11,20 @@ sys.argv = ["thermowatt_bridge.py"]
 ADDON = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _flag(monkeypatch, value):
-    if value is None:
-        monkeypatch.delenv("THERMOWATT_PROACTIVE_REFRESH", raising=False)
-    else:
-        monkeypatch.setenv("THERMOWATT_PROACTIVE_REFRESH", value)
-    import thermowatt_bridge
-    return importlib.reload(thermowatt_bridge).MyThermowattBridge.PROACTIVE_REFRESH
+def _flag(value):
+    """The flag as a fresh interpreter sees it (no reload: reloading would replace the
+    exception classes other test modules hold)."""
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if k != "THERMOWATT_PROACTIVE_REFRESH"}
+    if value is not None:
+        env["THERMOWATT_PROACTIVE_REFRESH"] = value
+    env["PYTHONPATH"] = os.pathsep.join([ADDON] + sys.path)
+    code = ("import sys; sys.argv=['x']; import thermowatt_bridge as m; "
+            "print(m.MyThermowattBridge.PROACTIVE_REFRESH)")
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True,
+                         text=True, timeout=60, cwd=ADDON)
+    assert out.returncode == 0, out.stderr
+    return out.stdout.strip().splitlines()[-1] == "True"
 
 
 @pytest.mark.parametrize("value,expected", [
@@ -26,9 +32,8 @@ def _flag(monkeypatch, value):
     ("garbage", False), ("2", False), ("1", True), ("true", True), (" True ", True),
     ("yes", True), ("ON", True),
 ])
-def test_env_parsing_is_default_off_and_strict(monkeypatch, value, expected):
-    assert _flag(monkeypatch, value) is expected
-    importlib.reload(sys.modules["thermowatt_bridge"])
+def test_env_parsing_is_default_off_and_strict(value, expected):
+    assert _flag(value) is expected
 
 
 def test_addon_option_is_declared_default_false_and_optional():
