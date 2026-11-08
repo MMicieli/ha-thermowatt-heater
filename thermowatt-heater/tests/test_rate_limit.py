@@ -657,7 +657,7 @@ class TestObservability:
         bridge.poll_status("SN")
         raw = _published(bridge, "P/SN/diagnostics")[-1].args[1]
         d = json.loads(raw)
-        assert set(d["rate_limit"]) == {"state", "active", "retry_at", "backoff_step", "last_reason", "last_at", "recovered_at", "events_total"}
+        assert set(d["rate_limit"]) == {"state", "active", "retry_at", "backoff_step", "last_reason", "last_at", "recovered_at", "events_total", "episodes"}
         assert {"status", "command", "auth", "other", "total", "rate_limited_responses", "blocked", "day"} <= set(d["requests"])
         for secret in ("SECRET-ACCESS", "SECRET-REFRESH", bridge.API_KEY):
             assert secret not in raw
