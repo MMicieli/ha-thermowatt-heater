@@ -1,6 +1,6 @@
 # Stage 2 design: demand-triggered telemetry with a reduced background poll (issue #17)
 
-**Status: design only. Nothing in this document is implemented, released or deployed.** No Package 19 change is authorised by it. Stage 1 (observability and proactive token refresh) is a separate pull request. This design depends on facts about the consuming Home Assistant packages that live in a different repository (`home-assistant-config`: Package 18 `18_ems_production_control_v1.yaml`, Package 19 `19_hws_thermowatt_translation_v1.yaml`); they are quoted below as read on 2026-11-08 and must be re-verified at implementation time.
+**Status: staged design, NOT deployed.** Draft PR #22 implements only the initial read-only MQTT wake-up in the existing bridge, with the 60 s polling default unchanged. Slower background polling, age-based availability, Package 19 scheduling and physical control qualification remain unimplemented and separately gated. Stage 1 observability was merged in PR #21. This design depends on facts about the consuming Home Assistant packages that live in a different repository (`home-assistant-config`: Package 18 `18_ems_production_control_v1.yaml`, Package 19 `19_hws_thermowatt_translation_v1.yaml`); they are quoted below as read on 2026-11-08 and must be re-verified at implementation time.
 
 The vendor quota is **not known** (see issue #17). Nothing here assumes a limit; the goal is to cut request volume as far as is safe, and to use the Stage 1 evidence snapshots to decide how much further is needed.
 
@@ -24,16 +24,14 @@ Constraints that must not be weakened:
 
 ### 2.1 Bridge (this repository, Stage 2 PR)
 
-1. **Refresh request.** New MQTT topic `P/<serial>/refresh` (payload: optional `{"id": "<opaque>"}`). On receipt the bridge performs one `/status` poll immediately through the normal `poll_status` path, so every existing validation, rate-limit and counter rule applies.
-   - Single flight: a request received while a poll is running is coalesced into it (no second request).
-   - Minimum spacing between demand-triggered polls (default 10 s): a request inside the spacing returns the existing fresh reading instead of sending a request.
-   - Refused (no I/O) while a quota window is active or recovery is unverified, exactly like polls and commands.
-   - One bounded transport retry after 5 s **only** for a transport failure (e.g. `RemoteDisconnected`); never for a quota response, never more than one.
-   - The result is published in the diagnostics as `refresh: {id, status: ok|failed|rate_limited|coalesced|spaced, completed_at}`. No Package 19 change is needed to read it.
+1. **Refresh request (Stage 2a draft).** Subscribe to non-retained MQTT topic `P/<serial>/refresh`. The existing MQTT callback flags the device and wakes the **existing** main polling loop; it never issues HTTP from the callback. An in-flight/recent status attempt satisfies a duplicate request (10 s attempted-poll spacing), and the existing `poll_status` path retains validation and quota protection.
+   - **No new response protocol:** callers already receive `last_successful_poll`, `poll_status` and retained status through existing discovery entities. No request IDs, additional MQTT diagnostic payload, worker thread or separate queue.
+   - Refresh requests are ignored while quota backoff is active or recovery is unverified; only the normal poll can probe the vendor.
+   - No bridge-side retry loop. A future Package 19 pre-cycle automation may send **one** further refresh if no new successful timestamp is observed by T-12 s; never retry a quota rejection.
 2. **Background poll.** The scheduled poll becomes configurable (`background_poll_interval`, default **60 s until Stage 2 is qualified**, target 300 s) and is skipped when a successful poll (demand or background) happened within half the interval, so the demand refresh doubles as the background poll.
 3. **Availability by age, not by failure count.** Today the device is marked offline after 5 consecutive failed polls (about 5 minutes at 60 s). At a 300 s cadence the same count would mean about 25 minutes of possibly stale "heating on" data. The bridge must therefore mark the device offline when `now - last_successful_poll > 300 s` (cadence-independent), preserving today's worst-case stale-data exposure. This is the most important invariant of the design (see section 4.1, which also compares it with a Package 19 guard).
 4. **Proactive token refresh margin scales with cadence**: `margin = max(120 s, background_interval + 60 s)`, so a 300 s cadence never lets a token expire between polls (which would revert to the 3-request reactive sequence).
-5. **Counters.** The Stage 1 ledger gains a `demand` attribution so the evidence shows how many requests were demand-triggered versus background versus commands.
+5. **Counters.** Reuse Stage 1's existing attempted-request ledger and poll timestamps. No additional counters or attribution fields unless a demonstrated measurement gap justifies them.
 6. **Unchanged:** command path, cooldown, confirmation window and 20 s fast polling, rate-limit backoff and persistence, command rejection while limited, no queue/replay.
 
 ### 2.2 Home Assistant (Package 19 / companion, not implemented)
@@ -60,8 +58,8 @@ The 120 s guard is unchanged and is satisfied by construction when refresh #1 or
 
 | Case | Behaviour |
 |---|---|
-| **Stale or failed refresh #1** | One bounded transport retry in the bridge after 5 s, plus the conditional #2 at T-12 s. A rejected (quota) response is never retried. Both failing leaves telemetry old; the 120 s gate fails closed for that cycle. No command is queued or replayed. |
-| **Retries and quota** | Retry budget is at most 1 bridge retry + 1 HA re-request per cycle (about 8 % observed failure rate: about 1.08 attempts per cycle expected). Nothing is ever sent during a quota window or while recovery is unverified. |
+| **Stale or failed refresh #1** | Package 19 may make one conditional second request at T-12 s if no newer valid telemetry arrived. Bridge does not automatically retry. Quota rejections are never retried; two failures leave the 120 s acquisition gate fail-closed. No command queue or replay. |
+| **Retries and quota** | Maximum one initial + one conditional HA request per decision cycle; the existing bridge backoff refuses demand requests while limited or recovery is unverified. About 8 % first-attempt failures implies roughly 1.08 attempts per decision on average, subject to measurements. |
 | **Command confirmation** | Unchanged: 20 s fast polls for 60 s after each command, the 15 s cooldown, Package 19's 60 s bounded waits. Demand refresh is not used for confirmation. The pre-write refresh in the handback script precedes the first write, not each confirmation. |
 | **Native mode change (Off/Eco/Auto/Holiday)** | Detected at the next refresh (up to 5 minutes later, versus 1 minute today). The guard still re-reads the mode immediately before each temperature write, and the handback pre-write refresh makes the first write's mode reading at most about 20 s old. A known non-Manual mode issues no command and releases ownership (existing behaviour). Acquisition (ownership off) requires `Manual` with telemetry at most about 86 s old versus up to about 122 s today. |
 | **Cloud unavailable during an active boost** | Telemetry ages past 300 s → device offline (section 2.1, item 3) → `available` off → EMHASS deselects → handback script waits ≤ 60 s for the water heater to be available, then halts with ownership **retained** and the captured baseline intact; one fresh attempt at each next EMHASS publication. The native thermostat remains the physical limit at the 70 °C setpoint. This is the same fail-closed outcome as today; the difference is only that quota exhaustion becomes less likely. |
@@ -114,7 +112,7 @@ This is a request-*volume* estimate for the bridge only. App usage and the vendo
 
 ## 6. Qualification plan
 
-1. **Bridge PR (Stage 2a), defaults unchanged:** refresh topic, spacing/coalescing, one retry, age-based offline threshold (flagged so default behaviour equals 1.8.0), configurable background interval (default 60 s). Unit tests: coalescing, spacing, no I/O during backoff and recovery-unverified, no retry on quota, single transport retry, age-based offline, token margin scaling, command path regression.
+1. **Bridge PR (Stage 2a), defaults unchanged:** implement and qualify refresh topic first; then, within the same draft PR after review, add age-based offline threshold and configurable background interval (default 60 s), with no bridge retry loop. Unit tests: coalescing, spacing, no HTTP from MQTT callback, no I/O during backoff or recovery-unverified, age-based offline, token margin scaling, command path regression.
 2. **Offline replay:** drive the Jinja availability template and the Package 19 conditions against recorded timelines (nominal, one failed refresh, both failed, 5-minute cloud outage during ownership, native mode change mid-boost) and show the decision and ownership outcome equals the 60 s baseline or is more conservative.
 3. **Shadow in production (operator-approved):** install the bridge with default 60 s polling and the Home Assistant refresh automation *disabled*; send manual refresh requests and verify diagnostics.
 4. **Additive HA automation (operator-approved):** enable the pre-cycle refresh while the background poll stays at 60 s; confirm in the ledger that demand refresh succeeds ahead of every cycle and the freshness age at decision time stays below 90 s.
