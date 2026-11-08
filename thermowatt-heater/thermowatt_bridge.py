@@ -126,6 +126,13 @@ class MyThermowattBridge:
     RATE_LIMIT_MAX_BACKOFF  = 3600  # seconds — hard ceiling (also bounds Retry-After)
     RATE_LIMIT_API_MESSAGE  = "daily request limit exceeded"  # matched case-insensitively
     COUNTER_FLUSH_INTERVAL  = 600   # seconds — max one request-counter config write per interval
+    # Rolling request statistics (observability only; never gates a request).
+    LEDGER_BUCKET_S         = 900    # resolution of the rolling ledger (15 min)
+    LEDGER_WINDOW_S         = 86400  # rolling window length (24 h)
+    LEDGER_FIELDS           = ("status", "command", "auth", "other",
+                               "rate_limited_responses", "blocked")
+    QUOTA_EPISODE_HISTORY   = 10     # quota episodes (rejection → recovery) retained
+    QUOTA_EPISODE_DIAG      = 3      # most recent episodes published in diagnostics
     COMMAND_ERROR_MAX_LEN   = 120   # truncate API-supplied error text kept in diagnostics
     # Informational only: age after which diagnostics label telemetry "stale". Mirrors
     # Package 19's 120 s freshness test but does NOT replace it; Package 19 still
@@ -196,6 +203,14 @@ class MyThermowattBridge:
         self._request_counters: dict = self._new_counters(self._utc_day())
         self._counters_dirty = False
         self._counters_last_flush: float = 0.0
+        # Rolling ledger of requests actually SENT (plus rejections / local blocks),
+        # in LEDGER_BUCKET_S buckets, and immutable quota-episode evidence. Guarded by
+        # _rate_limit_lock. Counts only: no tokens, identifiers or response content.
+        self._ledger: dict = {}               # {bucket_start:int -> [6 ints] per LEDGER_FIELDS}
+        self._ledger_since_ts: float = time.time()   # when this ledger began counting
+        self._sent_since_recovery: int = 0    # requests sent since the last confirmed recovery
+        self._since_recovery_ts: float = self._ledger_since_ts
+        self._quota_episodes: list = []       # oldest → newest, capped at QUOTA_EPISODE_HISTORY
         self._restore_persisted_state()
 
         # Per-device degraded state tracking
@@ -271,6 +286,57 @@ class MyThermowattBridge:
                         self._request_counters[key] = max(0, int(saved.get(key) or 0))
         except (TypeError, ValueError):
             pass
+        self._restore_ledger_and_episodes(now)
+
+    def _restore_ledger_and_episodes(self, now: float):
+        """Restore the rolling ledger and quota-episode evidence; never raises.
+
+        Anything malformed is skipped or ignored: observability data must never be
+        able to stall or crash the bridge. Buckets starting in the future (clock
+        change or corrupt file) are dropped so they cannot sit in the window forever.
+        """
+        try:
+            led = self.config.get("request_ledger")
+            if isinstance(led, dict) and led.get("bucket_s") == self.LEDGER_BUCKET_S:
+                width = self.LEDGER_BUCKET_S
+                buckets = {}
+                raw = led.get("buckets")
+                for key, row in (raw.items() if isinstance(raw, dict) else ()):
+                    try:
+                        start = int(key)
+                        vals = [int(v) for v in row]
+                    except (TypeError, ValueError):
+                        continue
+                    if (len(vals) != len(self.LEDGER_FIELDS) or min(vals) < 0
+                            or start % width != 0 or start > now + width
+                            or start + width <= now - self.LEDGER_WINDOW_S):
+                        continue
+                    buckets[start] = vals
+                self._ledger = buckets
+                since = led.get("since_ts")
+                if isinstance(since, (int, float)) and not isinstance(since, bool) and 0 < since <= now:
+                    self._ledger_since_ts = float(since)
+                sr = led.get("since_recovery")
+                if isinstance(sr, dict):
+                    sent = int(sr.get("sent") or 0)
+                    ts = sr.get("since_ts")
+                    if sent >= 0 and isinstance(ts, (int, float)) and not isinstance(ts, bool) and 0 < ts <= now:
+                        self._sent_since_recovery = sent
+                        self._since_recovery_ts = float(ts)
+        except Exception:  # noqa: BLE001
+            self._ledger = {}
+        try:
+            eps = self.config.get("quota_episodes")
+            clean = []
+            for ep in (eps if isinstance(eps, list) else ()):
+                if (isinstance(ep, dict) and isinstance(ep.get("id"), int)
+                        and isinstance(ep.get("rejected_responses"), int)
+                        and (ep.get("first_rejection") is None or isinstance(ep.get("first_rejection"), dict))
+                        and (ep.get("recovery") is None or isinstance(ep.get("recovery"), dict))):
+                    clean.append(ep)
+            self._quota_episodes = clean[-self.QUOTA_EPISODE_HISTORY:]
+        except Exception:  # noqa: BLE001
+            self._quota_episodes = []
 
     def _rate_limit_remaining(self, now=None) -> float:
         """Seconds of rate-limit backoff left (0 when not limited)."""
@@ -283,6 +349,7 @@ class MyThermowattBridge:
         if remaining > 0:
             with self._rate_limit_lock:
                 self._request_counters["blocked"] += 1
+                self._ledger_add_locked("blocked", time.time())
                 self._counters_dirty = True
             raise RateLimitedError(f"rate limited — no requests for {int(remaining)}s")
 
@@ -358,6 +425,10 @@ class MyThermowattBridge:
         now = time.time()
         with self._rate_limit_lock:
             self._request_counters["rate_limited_responses"] += 1
+            self._ledger_add_locked("rate_limited_responses", now)
+            open_ep = self._open_episode_locked()
+            if open_ep is not None:
+                open_ep["rejected_responses"] += 1
             self._rate_limit_generation += 1
             self._counters_dirty = True
             self._rate_limit_last_at = self._isoformat_epoch(now)
@@ -366,6 +437,8 @@ class MyThermowattBridge:
                 return
             self.rate_limit_backoff += 1
             self._rate_limit_events_total += 1
+            if self.rate_limit_backoff == 1 and open_ep is None:
+                self._open_quota_episode_locked(now, reason)
             delay = min(
                 self.RATE_LIMIT_BASE_BACKOFF * 2 ** (self.rate_limit_backoff - 1),
                 self.RATE_LIMIT_MAX_BACKOFF,
@@ -401,6 +474,7 @@ class MyThermowattBridge:
             self.rate_limit_backoff = 0
             self._rate_limit_until = 0.0
             self._rate_limit_recovered_at = self._isoformat_epoch(time.time())
+            self._close_quota_episode_locked(time.time())
         self._persist_rate_limit()
         print("[RATE LIMIT] Recovered — backoff cleared")
         return True
@@ -431,6 +505,14 @@ class MyThermowattBridge:
         """Copy counters into config (caller holds _config_lock and saves)."""
         with self._rate_limit_lock:
             self.config["request_counters"] = dict(self._request_counters)
+            self.config["request_ledger"] = {
+                "bucket_s": self.LEDGER_BUCKET_S,
+                "since_ts": self._ledger_since_ts,
+                "since_recovery": {"sent": self._sent_since_recovery,
+                                   "since_ts": self._since_recovery_ts},
+                "buckets": {str(k): list(v) for k, v in self._ledger.items()},
+            }
+            self.config["quota_episodes"] = json.loads(json.dumps(self._quota_episodes))
             self._counters_dirty = False
         self._counters_last_flush = time.time()
 
@@ -441,7 +523,123 @@ class MyThermowattBridge:
                 self._request_counters = self._new_counters(today)
             self._request_counters[category] += 1
             self._request_counters["total"] += 1
+            self._ledger_add_locked(category, time.time())
+            self._sent_since_recovery += 1
             self._counters_dirty = True
+
+    # ------------------------------------------------------------------ #
+    #  Rolling request ledger and quota-episode evidence (observability)  #
+    # ------------------------------------------------------------------ #
+
+    def _ledger_add_locked(self, field: str, now: float):
+        """Add one event to the current ledger bucket. Caller holds _rate_limit_lock."""
+        width = self.LEDGER_BUCKET_S
+        start = int(now // width) * width
+        row = self._ledger.get(start)
+        if row is None:
+            row = self._ledger[start] = [0] * len(self.LEDGER_FIELDS)
+            horizon = now - self.LEDGER_WINDOW_S
+            for old in [k for k in self._ledger if k + width <= horizon]:
+                del self._ledger[old]
+        row[self.LEDGER_FIELDS.index(field)] += 1
+
+    def _rolling_locked(self, now: float) -> dict:
+        """Rolling-24h counts. Caller holds _rate_limit_lock.
+
+        A bucket is included while any part of it is inside the window, so the
+        figures are an upper bound that can include up to LEDGER_BUCKET_S (15 min)
+        of older requests. `complete` is False until the ledger has been counting
+        for a full window (for example the first 24 h after install).
+        """
+        width = self.LEDGER_BUCKET_S
+        horizon = now - self.LEDGER_WINDOW_S
+        totals = [0] * len(self.LEDGER_FIELDS)
+        oldest = None
+        for start, row in self._ledger.items():
+            if start + width > horizon and start <= now:
+                oldest = start if oldest is None else min(oldest, start)
+                for i, v in enumerate(row):
+                    totals[i] += v
+        out = dict(zip(self.LEDGER_FIELDS, totals))
+        out["total"] = out["status"] + out["command"] + out["auth"] + out["other"]
+        out["window_s"] = self.LEDGER_WINDOW_S
+        out["resolution_s"] = width
+        out["oldest_bucket"] = self._isoformat_epoch(oldest)
+        out["counting_since"] = self._isoformat_epoch(self._ledger_since_ts)
+        out["complete"] = self._ledger_since_ts <= horizon
+        return out
+
+    def _evidence_counts_locked(self, now: float) -> dict:
+        """Counts-only evidence block shared by episode snapshots. Caller holds the lock."""
+        day = self._utc_day()
+        c = self._request_counters
+        fields = ("status", "command", "auth", "other", "total", "rate_limited_responses", "blocked")
+        day_counts = {k: (c[k] if c["day"] == day else 0) for k in fields}
+        return {
+            "utc_day": day,
+            "utc_day_counters": day_counts,
+            "rolling_24h": self._rolling_locked(now),
+            "since_recovery": {"sent": self._sent_since_recovery,
+                               "since": self._isoformat_epoch(self._since_recovery_ts)},
+        }
+
+    def _open_episode_locked(self):
+        if self._quota_episodes and self._quota_episodes[-1].get("recovery") is None:
+            return self._quota_episodes[-1]
+        return None
+
+    def _open_quota_episode_locked(self, now: float, reason: str):
+        """Record the immutable first-rejection snapshot of a new quota episode.
+
+        Counts include the rejected request itself (it was sent and counted before
+        its response was classified). `reason_class` is a fixed label, never response
+        text.
+        """
+        nxt = (self._quota_episodes[-1]["id"] + 1) if self._quota_episodes else 1
+        snapshot = {
+            "at": self._isoformat_epoch(now),
+            "reason_class": "http_429" if reason == "HTTP 429" else "quota_message",
+            "includes_rejected_request": True,
+        }
+        snapshot.update(self._evidence_counts_locked(now))
+        self._quota_episodes.append({
+            "id": nxt,
+            "first_rejection": snapshot,
+            "rejected_responses": 1,
+            "recovery": None,
+        })
+        del self._quota_episodes[:-self.QUOTA_EPISODE_HISTORY]
+
+    def _close_quota_episode_locked(self, now: float):
+        """Record the immutable confirmed-recovery snapshot, once, then restart the
+        since-recovery counter. Caller holds _rate_limit_lock."""
+        ep = self._open_episode_locked()
+        if ep is None:
+            # Recovery of a limit whose start predates this ledger (for example a
+            # window persisted by 1.8.0): record it without inventing a start.
+            nxt = (self._quota_episodes[-1]["id"] + 1) if self._quota_episodes else 1
+            ep = {"id": nxt, "first_rejection": None, "rejected_responses": 0, "recovery": None}
+            self._quota_episodes.append(ep)
+            del self._quota_episodes[:-self.QUOTA_EPISODE_HISTORY]
+        first = ep.get("first_rejection")
+        recovery = {"at": self._isoformat_epoch(now)}
+        recovery.update(self._evidence_counts_locked(now))
+        recovery["rejected_responses_in_episode"] = ep["rejected_responses"]
+        recovery["sent_after_first_rejection"] = None
+        recovery["episode_duration_s"] = None
+        if first is not None:
+            first_since = (first.get("since_recovery") or {}).get("sent")
+            if isinstance(first_since, int) and self._sent_since_recovery >= first_since:
+                recovery["sent_after_first_rejection"] = self._sent_since_recovery - first_since
+            try:
+                t0 = datetime.datetime.strptime(first["at"], "%Y-%m-%dT%H:%M:%S+00:00").replace(
+                    tzinfo=datetime.timezone.utc).timestamp()
+                recovery["episode_duration_s"] = round(max(0.0, now - t0), 1)
+            except (KeyError, TypeError, ValueError):
+                pass
+        ep["recovery"] = recovery
+        self._sent_since_recovery = 0
+        self._since_recovery_ts = now
 
     def _maybe_flush_counters(self, force: bool = False):
         """Throttled counter persistence: at most one write per COUNTER_FLUSH_INTERVAL."""
@@ -478,7 +676,14 @@ class MyThermowattBridge:
             "last_at": snap["last_at"],
             "recovered_at": snap["recovered_at"],
             "events_total": snap["events_total"],
+            "episodes": self._episodes_diagnostics(),
         }
+
+    def _episodes_diagnostics(self) -> list:
+        """Most recent quota episodes (counts only), newest last, as detached copies."""
+        with self._rate_limit_lock:
+            recent = self._quota_episodes[-self.QUOTA_EPISODE_DIAG:]
+            return json.loads(json.dumps(recent))
 
     def _next_pending_deadline(self):
         """Earliest unexpired pending-command deadline across devices, or None."""
@@ -1194,13 +1399,18 @@ class MyThermowattBridge:
                 }
             return summary, serialised
 
-    def _requests_diagnostics(self) -> dict:
+    def _requests_diagnostics(self, now=None) -> dict:
         """Per-UTC-day API request counters (bridge-wide; counts, no payload data)."""
         today = self._utc_day()
         with self._rate_limit_lock:
             counters = dict(self._request_counters)
+            rolling = self._rolling_locked(time.time() if now is None else now)
+            since_recovery = {"sent": self._sent_since_recovery,
+                              "since": self._isoformat_epoch(self._since_recovery_ts)}
         if counters["day"] != today:
             counters = self._new_counters(today)
+        counters["rolling_24h"] = rolling
+        counters["since_recovery"] = since_recovery
         return counters
 
     def _publish_diagnostics(self, serial: str):
@@ -1232,7 +1442,7 @@ class MyThermowattBridge:
             "command_status":       command_status,
             "commands":             commands,
             "rate_limit":           self._rate_limit_diagnostics(now),
-            "requests":             self._requests_diagnostics(),
+            "requests":             self._requests_diagnostics(now),
         }
         try:
             self.mqtt_client.publish(f"P/{serial}/diagnostics", json.dumps(payload), retain=True)
