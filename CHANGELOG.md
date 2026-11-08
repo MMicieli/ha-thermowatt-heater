@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Request-volume observability (issue #17, Stage 1).** Rolling-24 h request ledger (15-minute buckets; sent / rate-limited responses / locally blocked) persisted across restarts with validation of malformed data, requests sent since the last confirmed recovery, and immutable first-rejection and confirmed-recovery snapshots per quota episode (last 10 kept, newest 3 published as `rate_limit.episodes`). New diagnostics `requests.rolling_24h`, `requests.since_recovery`, `rate_limit.episodes`. Counts and fixed labels only: no tokens, credentials, device identifiers or vendor response text. No change to polling cadence, backoff, command, handback or authentication behaviour.
+- **Proactive access-token refresh (issue #17, Stage 1b, separately reviewable).** One refresh shortly before the ~30 min token expires instead of the 401 -> refresh -> replay sequence, saving about 48 requests/day. Never during a quota backoff or while recovery is unverified, once per token, non-fatal on failure, not on the command path; kill switch `THERMOWATT_PROACTIVE_REFRESH=0`.
+
+### Documentation
+- `docs/STAGE2-DEMAND-TELEMETRY-DESIGN.md`: design only (not implemented) for demand-triggered telemetry with a reduced background poll.
+
 ---
 
 ## [1.8.0] - 2026-11-06 (release candidate; not released)
