@@ -239,6 +239,7 @@ class TestPollFailureDegraded:
         sn = "SN_RCV"
         bridge.config["devices"][sn] = {"name": "Test", "last_setpoint": 60}
         bridge._consecutive_failures[sn] = bridge.DEGRADED_THRESHOLD
+        bridge._avail_state[sn] = "offline"  # as published when the threshold was reached
 
         with patch.object(bridge, "request", return_value=_success_resp()), \
              patch.object(bridge, "_save_config"):

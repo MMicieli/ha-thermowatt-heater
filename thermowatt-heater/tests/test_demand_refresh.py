@@ -100,3 +100,85 @@ def test_connect_subscribes_existing_commands_and_read_only_refresh(bridge):
     topics = [c.args[0] for c in client.subscribe.call_args_list]
     assert "P/SN/CMD/#" in topics
     assert "P/SN/refresh" in topics
+
+
+# --- review fixes: multi-device side effects, attempted-vs-fresh, retry -------
+
+def _two_devices(bridge):
+    bridge.config["devices"]["SN2"] = {"name": "HWS2", "last_setpoint": 58}
+
+
+def test_demand_for_one_device_does_not_poll_a_recently_polled_other_device(bridge):
+    _two_devices(bridge)
+    now = time.time()
+    bridge._last_status_attempt["SN2"] = now - 5   # not due for a 60 s background poll
+    bridge.poll_status = MagicMock(return_value=(True, 200))
+    bridge.on_mqtt_message(None, None, msg("SN"))
+    bridge._run_poll_cycle()
+    bridge.poll_status.assert_called_once_with("SN")
+
+
+def test_attempt_that_failed_is_not_reported_as_satisfying_the_request(bridge, capsys):
+    bridge._last_status_attempt["SN"] = time.time() - 1
+    bridge._last_successful_poll["SN"] = time.time() - 400   # attempt did not produce telemetry
+    bridge.poll_status = MagicMock()
+    bridge.on_mqtt_message(None, None, msg())
+    bridge._run_poll_cycle()
+    bridge.poll_status.assert_not_called()                    # still storm-guarded ...
+    assert "gave no fresh telemetry" in capsys.readouterr().out    # ... but honestly reported
+
+
+def test_fresh_success_is_reported_as_satisfying_the_request(bridge, capsys):
+    bridge._last_status_attempt["SN"] = time.time() - 1
+    bridge._last_successful_poll["SN"] = time.time() - 1
+    bridge.poll_status = MagicMock()
+    bridge.on_mqtt_message(None, None, msg())
+    bridge._run_poll_cycle()
+    out = capsys.readouterr().out
+    assert "gave fresh telemetry" in out and "no fresh" not in out
+
+
+def test_transport_failure_retries_once_never_twice(bridge):
+    bridge.DEMAND_RETRY_DELAY = 0
+    bridge.poll_status = MagicMock(return_value=(False, None))
+    bridge.on_mqtt_message(None, None, msg())
+    bridge._run_poll_cycle()
+    assert bridge.poll_status.call_count == 2
+
+
+def test_http_error_or_quota_response_is_not_retried(bridge):
+    bridge.DEMAND_RETRY_DELAY = 0
+    bridge.login = MagicMock()
+    bridge.poll_status = MagicMock(return_value=(False, 500))
+    bridge.on_mqtt_message(None, None, msg())
+    bridge._run_poll_cycle()
+    assert bridge.poll_status.call_count == 1
+
+    def quota(serial):
+        bridge._rate_limit_until = time.time() + 120
+        bridge.rate_limit_backoff = 1
+        return (False, None)
+    bridge.poll_status = MagicMock(side_effect=quota)
+    bridge._rate_limit_until = 0
+    bridge.rate_limit_backoff = 0
+    bridge._last_status_attempt.clear()
+    bridge.on_mqtt_message(None, None, msg())
+    bridge._run_poll_cycle()
+    assert bridge.poll_status.call_count == 1
+
+
+def test_background_poll_failure_without_demand_is_not_retried(bridge):
+    bridge.poll_status = MagicMock(return_value=(False, None))
+    bridge._run_poll_cycle()
+    assert bridge.poll_status.call_count == 1
+
+
+def test_repeated_requests_send_at_most_one_request_per_spacing_window(bridge):
+    bridge.poll_status = MagicMock(return_value=(True, 200))
+    for _ in range(50):
+        bridge.on_mqtt_message(None, None, msg())
+    bridge._run_poll_cycle()
+    for _ in range(50):                     # a second burst moments later
+        bridge.on_mqtt_message(None, None, msg())
+    bridge._run_poll_cycle()
+    assert bridge.poll_status.call_count == 1

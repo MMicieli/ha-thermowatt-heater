@@ -12,11 +12,13 @@ options:
   password: ""
   element_wattage: 3000
   proactive_token_refresh: false
+  poll_interval: 60
 schema:
   email: str
   password: password
   element_wattage: int
   proactive_token_refresh: bool?
+  poll_interval: int(60,600)?
 mqtt: true
 services:
   - mqtt:need

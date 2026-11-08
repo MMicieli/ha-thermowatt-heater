@@ -1,6 +1,6 @@
 #!/bin/bash
 # Stubbed container e2e of the REAL add-on entrypoint (Dockerfile ENTRYPOINT /init + CMD /run.sh, bashio).
-# ~10 minutes each. usage: run_e2e.sh <name> <A|B|C|D|F|G>   (run from this directory)
+# ~10 minutes each. usage: run_e2e.sh <name> <A|B|C|D|F|G|H>   (run from this directory)
 #   image: ./build_image.sh HEAD thermowatt-pr16:test   (override with IMAGE=...; do NOT docker build from a CRLF working tree)
 #   A: HTTP-200 'Daily request limit exceeded' window, commands refused in-window, recovery, Eco accepted
 #   B: HTTP 429 window; container stopped (SIGTERM) and restarted inside the window (persisted backoff)
@@ -32,6 +32,7 @@ docker run -d --name $NET-mqtt --network $NET --network-alias mqtt -v "$D/$OUT/m
 #   D  option ABSENT (an existing install's config), 300 s tokens: reactive 401 -> refresh -> replay only
 #   F  proactive ON, first /refresh answered HTTP 500: one failed attempt, then the reactive fallback
 #   G  proactive ON, 150 s tokens, quota window 30-100 s: no auth/command traffic during backoff, restart evidence
+#   H  Stage 2: poll_interval=120, retained refresh ignored, burst of refresh requests -> one status poll (opaque tokens)
 JWT_ENV=""
 case "$SCEN" in
   A) LF=90; LU=330; ST=200 ;;
@@ -39,7 +40,8 @@ case "$SCEN" in
   C|D) LF=-1; LU=-1; ST=200; JWT_ENV="-e JWT_LIFETIME=300" ;;
   F)   LF=-1; LU=-1; ST=200; JWT_ENV="-e JWT_LIFETIME=300 -e REFRESH_FAIL_FIRST=1" ;;
   G)   LF=30; LU=100; ST=200; JWT_ENV="-e JWT_LIFETIME=150" ;;
-  *) echo "unknown scenario $SCEN (A|B|C|D|F|G)"; exit 2 ;;
+  H)   LF=-1; LU=-1; ST=200 ;;
+  *) echo "unknown scenario $SCEN (A|B|C|D|F|G|H)"; exit 2 ;;
 esac
 docker run -d --name $NET-api --network $NET --network-alias myapp-connectivity.com -e LIMIT_FROM=$LF -e LIMIT_UNTIL=$LU -e LIMIT_STYLE=$ST $JWT_ENV \
   -v "$D/stub_api.py:/stub_api.py:ro" -v "$D/ca.pem:/certs/ca.pem:ro" -v "$D/key.pem:/certs/key.pem:ro" python:3.12-alpine python -u /stub_api.py >/dev/null
@@ -47,6 +49,7 @@ docker run -d --name $NET-api --network $NET --network-alias myapp-connectivity.
 # Stub Supervisor: add-on options + MQTT service discovery (what run.sh reads through bashio)
 OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000}'
 # C, F, G enable the new option; A, B and D keep the original options (no proactive_token_refresh key).
+case "$SCEN" in H) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"poll_interval":120}' ;; esac
 case "$SCEN" in C|F|G) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"proactive_token_refresh":true}' ;; esac
 MQ="{\"host\":\"mqtt\",\"port\":1883,\"username\":\"tw-user\",\"password\":\"$MQPASS\",\"ssl\":false,\"protocol\":\"3.1.1\"}"
 docker run -d --name $NET-sup --network $NET --network-alias supervisor -e SUPERVISOR_TOKEN=$TOKEN -e ADDON_OPTIONS_JSON="$OPTS" -e MQTT_SERVICE_JSON="$MQ" \
@@ -58,6 +61,8 @@ sleep 1
 # The real entrypoint: image ENTRYPOINT (/init) + CMD (/run.sh). No --entrypoint override.
 run_bridge() { docker run -d --name $1 --network $NET -e SUPERVISOR_TOKEN=$TOKEN -e REQUESTS_CA_BUNDLE=/ca.pem \
   -v "$D/ca.pem:/ca.pem:ro" -v $NET-data:/data "$IMAGE" >/dev/null; }
+# H: a RETAINED refresh request exists before the bridge starts; it must not cause a poll.
+[ "$SCEN" = H ] && docker exec $NET-mqtt mosquitto_pub -r -u tw-user -P $MQPASS -t P/STUBSN1/refresh -m 1
 run_bridge $NET-bridge
 START=$(date +%s)
 at() { local target=$1; local now=$(( $(date +%s) - START )); [ $target -gt $now ] && sleep $(( target - now )); }
@@ -69,6 +74,11 @@ if [ "$SCEN" = A ]; then
   at 300; pub P/STUBSN1/CMD/TEMP 50
   at 520; pub P/STUBSN1/CMD/MODE Eco
   at 600
+  docker stop -t 20 $NET-bridge >/dev/null
+  echo "{\"exit_code\": $(exit_code $NET-bridge)}" > "$META"
+elif [ "$SCEN" = H ]; then
+  at 40; for i in 1 2 3 4 5; do pub P/STUBSN1/refresh 1; done   # burst: one coalesced poll
+  at 190
   docker stop -t 20 $NET-bridge >/dev/null
   echo "{\"exit_code\": $(exit_code $NET-bridge)}" > "$META"
 elif [ "$SCEN" = D ] || [ "$SCEN" = F ]; then

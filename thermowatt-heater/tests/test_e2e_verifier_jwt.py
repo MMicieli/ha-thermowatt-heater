@@ -222,3 +222,44 @@ def test_g_evidence_violations():
     assert any("decreased" in x for x in run_g(mqtt=G_MQTT + [diag(3, episodes=[EP])]))
     assert any("command NOT sent" in x or "refused" in x for x in run_g(log=logtext(True, "deferred: rate limited")))
     assert any("deferred" in x for x in run_g(log=logtext(True, "command NOT sent")))
+
+
+# ───────────────────── H (Stage 2: 120 s background + demand refresh) ─────────────────────
+def hdiag(n):
+    return ("P/STUBSN1/diagnostics", json.dumps({"proactive_token_refresh": False, "poll_interval": 120}))
+
+
+H_API = [ev(0, "POST", "/login"), ev(0.2, "GET", "/user-info", "ok"), S(1), S(38), S(158)]
+H_META = {"exit_code": 0}
+H_MQTT = [MQTT_STATUS, hdiag(1), hdiag(2), hdiag(3)]
+H_LOG = logtext(False, "poll interval option: 120", "Polling loop starting (background=120s,")
+
+
+def run_h(api=H_API, log=H_LOG, mqtt=H_MQTT, meta=H_META):
+    return v.check_scenario_h(api, log, mqtt, SUP, meta)
+
+
+def test_correct_h_passes():
+    assert run_h() == []
+
+
+@pytest.mark.parametrize("name,mutate,needle", [
+    ("retained_or_burst_extra_poll", lambda api: api.insert(4, S(39)), "exactly 3"),
+    ("burst_not_coalesced", lambda api: api.insert(4, S(40)), "exactly 3"),
+    ("retained_caused_early_poll", lambda api: api.__setitem__(3, S(2)), "demand poll at"),
+    ("demand_missing", lambda api: api.pop(3), "exactly 3"),
+    ("background_not_a_full_interval", lambda api: api.__setitem__(4, S(80)), "background poll"),
+    ("refresh_request_sent", lambda api: api.append(ev(50, "POST", "/refresh")), "read-only"),
+    ("command_sent", lambda api: api.append(ev(50, "POST", "/off")), "read-only"),
+])
+def test_h_violations_fail(name, mutate, needle):
+    api = copy.deepcopy(H_API)
+    mutate(api)
+    assert any(needle in x for x in run_h(api=api)), run_h(api=api)
+
+
+def test_h_interval_and_availability_checks():
+    assert any("120 s background" in x for x in run_h(log=logtext(False)))
+    assert any("poll_interval" in x for x in run_h(mqtt=[MQTT_STATUS, ("P/STUBSN1/diagnostics",
+               json.dumps({"proactive_token_refresh": False, "poll_interval": 60}))]))
+    assert any("offline" in x for x in run_h(mqtt=H_MQTT + [("P/STUBSN1/availability", "offline")]))
