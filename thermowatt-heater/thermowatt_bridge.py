@@ -199,6 +199,10 @@ class MyThermowattBridge:
         # before its first eligible confirmation poll.
         self._confirm_until: float = 0.0  # epoch time until which fast-poll is active
         self._poll_wakeup = threading.Event()
+        # Read-only refresh requests wake this same polling loop. No worker,
+        # HTTP call or command queue is created on the MQTT callback thread.
+        self._demand_requested = set()  # guarded by _config_lock
+        self._last_status_attempt = {}
 
         # Per-device command cooldown and confirmation state, keyed by command type.
         # MODE and TEMP remain independent so a valid paired sequence is supported.
@@ -1092,6 +1096,7 @@ class MyThermowattBridge:
                 device_serials = list(self.config.get('devices', {}).keys())
             for serial in device_serials:
                 client.subscribe(f"P/{serial}/CMD/#")
+                client.subscribe(f"P/{serial}/refresh")
                 # Restore per-device availability consistent with current failure state
                 failures  = self._consecutive_failures.get(serial, 0)
                 dev_avail = "offline" if failures >= self.DEGRADED_THRESHOLD else "online"
@@ -1920,8 +1925,21 @@ class MyThermowattBridge:
                 print(f"[CMD] Ignoring retained command on {msg.topic}")
                 return
 
+            parts = msg.topic.split('/')
+            if len(parts) == 3 and parts[0] == "P" and parts[2] == "refresh":
+                # Read-only request: no cloud I/O here, no new mode of control.
+                # The normal poll loop alone can perform quota-recovery probes.
+                serial = parts[1]
+                if self._rate_limit_snapshot()["step"] > 0:
+                    return
+                with self._config_lock:
+                    if serial not in self.config.get("devices", {}):
+                        return
+                    self._demand_requested.add(serial)
+                self._poll_wakeup.set()
+                return
+
             payload = msg.payload.decode()
-            parts   = msg.topic.split('/')
             if len(parts) < 4:
                 return
             sn = parts[1]
@@ -2062,10 +2080,20 @@ class MyThermowattBridge:
 
         with self._config_lock:
             device_serials = list(self.config.get('devices', {}).keys())
+            requested = set(self._demand_requested)
+            self._demand_requested.clear()
 
         for serial in device_serials:
             if self._rate_limit_remaining() > 0:
                 break  # rate limit has priority over normal polling
+            now = time.time()
+            # If a request arrived during a recent in-flight poll, that
+            # existing attempt satisfied it; do not send a duplicate.
+            # Preserve the normal 20 s post-command confirmation cadence.
+            if (serial in requested and now >= self._confirm_until
+                    and now - self._last_status_attempt.get(serial, 0) < 10):
+                continue
+            self._last_status_attempt[serial] = now
             self.poll_count += 1
             generation = self._rate_limit_gen()  # before the request is sent
             success, status_code = self.poll_status(serial)
