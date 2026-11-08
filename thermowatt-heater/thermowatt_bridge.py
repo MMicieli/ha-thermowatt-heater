@@ -1,4 +1,4 @@
-import sys, json, time, uuid, os, signal, threading, requests, urllib3, datetime, builtins
+import sys, json, time, uuid, os, signal, threading, requests, urllib3, datetime, builtins, base64
 import paho.mqtt.client as mqtt
 from paho.mqtt.enums import CallbackAPIVersion
 
@@ -133,6 +133,13 @@ class MyThermowattBridge:
                                "rate_limited_responses", "blocked")
     QUOTA_EPISODE_HISTORY   = 10     # quota episodes (rejection → recovery) retained
     QUOTA_EPISODE_DIAG      = 3      # most recent episodes published in diagnostics
+    # Proactive access-token refresh (issue #17 Stage 1b). Replaces the reactive
+    # 401 -> refresh -> replay sequence (3 requests per ~30 min token lifetime) with a
+    # single refresh just before expiry (1 request). Kill switch: set the environment
+    # variable THERMOWATT_PROACTIVE_REFRESH=0. The reactive 401 path is unchanged and
+    # remains the fallback.
+    PROACTIVE_REFRESH          = os.environ.get("THERMOWATT_PROACTIVE_REFRESH", "1").strip() != "0"
+    PROACTIVE_REFRESH_MARGIN_S = 120    # refresh when the access token has <= this long left
     COMMAND_ERROR_MAX_LEN   = 120   # truncate API-supplied error text kept in diagnostics
     # Informational only: age after which diagnostics label telemetry "stale". Mirrors
     # Package 19's 120 s freshness test but does NOT replace it; Package 19 still
@@ -211,6 +218,7 @@ class MyThermowattBridge:
         self._sent_since_recovery: int = 0    # requests sent since the last confirmed recovery
         self._since_recovery_ts: float = self._ledger_since_ts
         self._quota_episodes: list = []       # oldest → newest, capped at QUOTA_EPISODE_HISTORY
+        self._proactive_attempt_exp = None    # token `exp` for which a proactive refresh was tried
         self._restore_persisted_state()
 
         # Per-device degraded state tracking
@@ -810,6 +818,66 @@ class MyThermowattBridge:
                 self._update_auth(res['accessToken'], res['refreshToken'])
                 return True
             return False
+
+    @staticmethod
+    def _jwt_exp(token):
+        """The `exp` claim (epoch seconds) of a JWT, or None if absent/malformed.
+
+        Only the payload's `exp` is read; the token is never verified, logged or
+        stored by this helper.
+        """
+        try:
+            payload = token.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+            exp = claims.get("exp")
+            if isinstance(exp, bool) or not isinstance(exp, (int, float)) or exp <= 0:
+                return None
+            return float(exp)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _maybe_proactive_refresh(self):
+        """Refresh the access token shortly before it expires (poll thread only).
+
+        Safety properties (each covered by tests):
+        - never sends anything while a quota backoff window is active, nor while
+          recovery is still unverified (rate_limit step > 0): those probes keep the
+          existing minimal reactive behaviour;
+        - at most one attempt per access token, so a rejected or failing refresh can
+          never turn into a refresh-per-cycle loop;
+        - failures are swallowed: the reactive 401 -> refresh -> replay path and
+          re-login remain the fallback, and a failed proactive refresh is not a poll
+          failure;
+        - a quota response during the refresh enters the normal backoff (via
+          _note_response) like any other request;
+        - never used on the command path.
+        """
+        if not self.PROACTIVE_REFRESH:
+            return
+        if self._rate_limit_remaining() > 0 or self._rate_limit_snapshot()["step"] > 0:
+            return
+        with self._config_lock:
+            token = self.config.get("access_token")
+            refresh = self.config.get("refresh_token")
+        if not token or not refresh:
+            return
+        exp = self._jwt_exp(token)
+        if exp is None or exp - time.time() > self.PROACTIVE_REFRESH_MARGIN_S:
+            return
+        if self._proactive_attempt_exp == exp:
+            return
+        self._proactive_attempt_exp = exp
+        try:
+            ok = self.refresh_session()
+        except RateLimitedError:
+            print("[AUTH] Proactive token refresh deferred: rate limited")
+            return
+        except Exception as e:  # noqa: BLE001
+            print(f"[AUTH] Proactive token refresh failed ({type(e).__name__}); "
+                  "reactive refresh remains available")
+            return
+        print("[AUTH] Proactive token refresh " + (
+            "succeeded" if ok else "rejected; reactive refresh remains available"))
 
     def request(self, method, endpoint, serial=None, **kwargs):
         with self._http_lock:
@@ -1824,6 +1892,8 @@ class MyThermowattBridge:
             if time.time() >= self._confirm_until:
                 self.current_poll_interval = self.POLL_INTERVAL
                 print(f"[POLL] Confirmation window closed — resuming normal polling ({self.POLL_INTERVAL}s)")
+
+        self._maybe_proactive_refresh()
 
         with self._config_lock:
             device_serials = list(self.config.get('devices', {}).keys())
