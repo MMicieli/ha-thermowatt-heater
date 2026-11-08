@@ -1,6 +1,10 @@
 """Assertions for the stubbed container e2e (run_e2e.sh). Exits non-zero on any violation.
 
-Usage: verify_e2e.py <A|B> <out-dir>
+Usage: verify_e2e.py <A|B|C|D|F|G> <out-dir>
+
+A and B (rate-limit windows, opaque tokens) are unchanged. C, D, F and G use synthetic JWT access
+tokens with short controlled expiry (see stub_api.py JWT_LIFETIME) to exercise the proactive
+token-refresh branch (issue #17, PR #21).
 
 The check_* functions are pure (parsed data in, list of failure strings out) so they are
 unit-tested with injected violations in tests/test_e2e_verifier.py.
@@ -199,6 +203,244 @@ def check_scenario_b(api, bridge_log, mqtt, supervisor, meta):
     return f
 
 
+# ───────────────────── JWT / proactive-refresh scenarios (C, D, F, G) ─────────────────────
+JWT_SECRETS = ("eyJhbGci", "SIGNATURE-SECRET-JWT", "stub-refresh-SECRET")
+JWT_MARGIN = 120      # PROACTIVE_REFRESH_MARGIN_S
+POLL = 62             # effective poll interval (s)
+
+
+def _jwt_common(api, bridge_log, mqtt, supervisor, meta, *, flag_expected):
+    """Hygiene and plumbing shared by C/D/F/G (check_common minus the A/B-only path/secret lists)."""
+    f = []
+    if "Starting Thermowatt Bridge for" not in bridge_log:
+        f.append("run.sh log line missing: entrypoint not exercised")
+    want = f"proactive token refresh: {1 if flag_expected else 0})"
+    if want not in bridge_log:
+        f.append(f"run.sh did not report {want!r}")
+    seen = {(e["p"], e.get("authed"), e.get("known")) for e in supervisor}
+    for path in ALLOWED_SUPERVISOR:
+        if (path, True, True) not in seen:
+            f.append(f"supervisor never served authorised {path}")
+    for e in supervisor:
+        if e["p"] not in ALLOWED_SUPERVISOR or not e.get("authed"):
+            f.append(f"unexpected supervisor request {e['p']} authed={e.get('authed')}")
+    if not any(t == "P/STUBSN1/STATUS" for t, _ in mqtt):
+        f.append("no STATUS published via authenticated broker")
+    blobs = (("bridge log", bridge_log), ("mqtt", "\n".join(p for _, p in mqtt)), ("api log", json.dumps(api)))
+    for secret in SECRETS[:3] + JWT_SECRETS:
+        for name, blob in blobs:
+            if secret in blob:
+                f.append(f"secret {secret!r} leaked in {name}")
+    for bad in ("Traceback", "FAILED:"):
+        if bad in bridge_log:
+            f.append(f"bridge log contains {bad!r}")
+    allowed = {"/login", "/refresh", "/user-info", "/status"} | COMMAND_PATHS
+    unexpected = sorted({e["p"] for e in api if e["p"] not in allowed})
+    if unexpected:
+        f.append(f"unexpected API paths: {unexpected}")
+    if meta.get("first_exit_code", meta.get("exit_code")) != 0:
+        f.append(f"container exit code {meta.get('first_exit_code', meta.get('exit_code'))}")
+    if meta.get("second_exit_code", 0) != 0:
+        f.append(f"second container exit code {meta.get('second_exit_code')}")
+    diags = diagnostics(mqtt)
+    if not diags:
+        f.append("no diagnostics captured")
+    for d in diags:
+        if d.get("proactive_token_refresh") is not flag_expected:
+            f.append(f"diagnostics proactive_token_refresh={d.get('proactive_token_refresh')!r}, expected {flag_expected}")
+            break
+    return f
+
+
+def _by_path(api, path):
+    return [e for e in api if e["p"] == path]
+
+
+def _unauthorised(api):
+    """Requests the stub answered 401 (JWT mode logs `auth` for everything but login/refresh)."""
+    return [e for e in api if e.get("auth") in ("expired", "none") and not e["limited"]]
+
+
+def _check_reactive_replay(api, f, label):
+    """Every 401 is followed, in log order, by exactly one /refresh and then ONE replayed request.
+
+    Order is taken from the log sequence, not the timestamps: the stub rounds time to 0.1 s and the
+    three requests of a replay normally share one timestamp."""
+    for i, ev in enumerate(api):
+        if ev.get("auth") not in ("expired", "none") or ev["limited"]:
+            continue
+        nxt = api[i + 1:i + 4]
+        if not nxt or nxt[0]["p"] != "/refresh" or nxt[0]["t"] - ev["t"] > 6:
+            f.append(f"{label}: 401 at t={ev['t']} not followed by /refresh ({[e['p'] for e in nxt[:1]]})")
+            continue
+        replay = nxt[1:3]
+        if (not replay or replay[0]["p"] != ev["p"] or replay[0].get("auth") != "ok"
+                or replay[0]["t"] - nxt[0]["t"] > 6):
+            f.append(f"{label}: no authorised replay of {ev['p']} after the refresh at t={nxt[0]['t']}")
+        elif len(replay) > 1 and replay[1]["p"] == ev["p"] and replay[1]["t"] - replay[0]["t"] < 3:
+            f.append(f"{label}: replay of {ev['p']} sent more than once")
+
+
+def _ledger_total(ledger):
+    if not isinstance(ledger, dict):
+        return None
+    total = 0
+    for row in (ledger.get("buckets") or {}).values():
+        total += sum(row[:4])          # status, command, auth, other = attempted
+    return total
+
+
+def _check_ledger_continuity(diags, f):
+    """rolling_24h.attempted never decreases across the whole run, restart included."""
+    seq = [d["requests"]["rolling_24h"]["attempted"] for d in diags if "rolling_24h" in d.get("requests", {})]
+    if not seq:
+        f.append("no requests.rolling_24h in diagnostics")
+        return seq
+    if any(b < a for a, b in zip(seq, seq[1:])):
+        f.append(f"rolling_24h.attempted decreased across the restart: {seq}")
+    for d in diags:
+        r = d["requests"]["rolling_24h"]
+        if r["attempted"] != r["transport_failed"] + r["responses_received"]:
+            f.append(f"attempted != transport_failed + responses_received: {r}")
+            break
+    return seq
+
+
+def _check_persisted_ledger(api, meta, f):
+    """Persisted request_ledger after the first stop equals the API requests the stub logged."""
+    seen = meta.get("api_requests_run1")
+    total = _ledger_total(meta.get("persisted_ledger"))
+    if seen is None or total is None:
+        f.append("persisted request_ledger or run-1 API request count missing")
+    elif total != seen:
+        f.append(f"persisted ledger counts {total} attempted requests, stub saw {seen}")
+
+
+def check_scenario_c(api, bridge_log, mqtt, supervisor, meta):
+    """Proactive refresh ON, token lifetime 300 s, no quota: exactly one refresh, before expiry, no 401."""
+    f = _jwt_common(api, bridge_log, mqtt, supervisor, meta, flag_expected=True)
+    if len(_by_path(api, "/login")) != 2:     # the bridge logs in once per boot: run 1 and the restart
+        f.append(f"expected 2 logins (one per boot), saw {len(_by_path(api, '/login'))}")
+    run1 = [e for e in api if e["t"] <= meta.get("run1_end_t", 1e9)]
+    refreshes = _by_path(run1, "/refresh")
+    login_t = _by_path(api, "/login")[0]["t"] if _by_path(api, "/login") else 0
+    if len(refreshes) != 1:
+        f.append(f"expected exactly 1 proactive refresh in run 1, saw {[e['t'] for e in refreshes]}")
+    else:
+        lo, hi = login_t + 300 - JWT_MARGIN - TOL, login_t + 300 - JWT_MARGIN + POLL + TOL
+        if not lo <= refreshes[0]["t"] <= hi:
+            f.append(f"proactive refresh at t={refreshes[0]['t']}, expected within [{lo:.0f}, {hi:.0f}] (before expiry at {login_t + 300:.0f})")
+        nxt = [e for e in run1 if e["t"] > refreshes[0]["t"]][:1]
+        if not nxt or nxt[0]["p"] != "/status" or nxt[0].get("auth") != "ok":
+            f.append("the poll after the proactive refresh was not an authorised /status")
+    if _unauthorised(api):
+        f.append(f"401 responses despite proactive refresh: {[(e['p'], e['t']) for e in _unauthorised(api)]}")
+    if "Proactive token refresh succeeded" not in bridge_log:
+        f.append("log line 'Proactive token refresh succeeded' missing")
+    if any(e["limited"] for e in api):
+        f.append("unexpected quota response in scenario C")
+    seq = _check_ledger_continuity(diagnostics(mqtt), f)
+    _check_persisted_ledger(api, meta, f)
+    if seq and meta.get("api_requests_run1") is not None and seq[-1] <= meta["api_requests_run1"]:
+        f.append("second run did not continue from the persisted ledger")
+    return f
+
+
+def check_scenario_d(api, bridge_log, mqtt, supervisor, meta):
+    """Option ABSENT from the Supervisor config (existing install), JWT tokens: reactive path only."""
+    f = _jwt_common(api, bridge_log, mqtt, supervisor, meta, flag_expected=False)
+    refreshes = _by_path(api, "/refresh")
+    expired = _unauthorised(api)
+    if len(expired) != 1:
+        f.append(f"expected exactly 1 expired-token 401, saw {[(e['p'], e['t']) for e in expired]}")
+    if len(refreshes) != 1:
+        f.append(f"expected exactly 1 (reactive) refresh, saw {[e['t'] for e in refreshes]}")
+    if expired and refreshes and refreshes[0]["t"] < expired[0]["t"]:
+        f.append("a refresh was sent BEFORE the 401: proactive refresh is not off by default")
+    _check_reactive_replay(api, f, "default-off")
+    if "Proactive token refresh" in bridge_log:
+        f.append("proactive refresh logged although the option is absent")
+    if len(_by_path(api, "/login")) != 1:
+        f.append(f"expected 1 login, saw {len(_by_path(api, '/login'))}")
+    return f
+
+
+def check_scenario_f(api, bridge_log, mqtt, supervisor, meta):
+    """Proactive ON, first refresh answered HTTP 500: attempted once, then the reactive path recovers."""
+    f = _jwt_common(api, bridge_log, mqtt, supervisor, meta, flag_expected=True)
+    refreshes = _by_path(api, "/refresh")
+    expired = _unauthorised(api)
+    if len(refreshes) != 2:
+        f.append(f"expected exactly 2 refreshes (1 failed proactive + 1 reactive), saw {[e['t'] for e in refreshes]}")
+    if len(expired) != 1:
+        f.append(f"expected exactly 1 401 after the failed proactive refresh, saw {[(e['p'], e['t']) for e in expired]}")
+    elif len(refreshes) == 2:
+        if not api.index(refreshes[0]) < api.index(expired[0]) < api.index(refreshes[1]):  # log order
+            f.append("order must be: failed proactive refresh, 401, reactive refresh")
+        if refreshes[1]["t"] - refreshes[0]["t"] < POLL:
+            f.append("second refresh followed the first too closely: proactive retried within the token's life")
+    _check_reactive_replay(api, f, "fallback")
+    if "Proactive token refresh rejected" not in bridge_log:
+        f.append("log line 'Proactive token refresh rejected' missing")
+    if len(_by_path(api, "/login")) != 1:
+        f.append(f"expected 1 login (no re-login), saw {len(_by_path(api, '/login'))}")
+    return f
+
+
+def check_scenario_g(api, bridge_log, mqtt, supervisor, meta):
+    """Proactive ON, quota window opens as the token nears expiry: nothing sent during backoff."""
+    f = _jwt_common(api, bridge_log, mqtt, supervisor, meta, flag_expected=True)
+    limited = [e for e in api if e["limited"]]
+    if len(limited) != 1 or limited[0]["p"] != "/refresh":
+        f.append(f"expected exactly one limited response, to the proactive /refresh; saw {[(e['p'], e['t']) for e in limited]}")
+        return f
+    lim = limited[0]
+    window = [e for e in api if lim["t"] + 0.5 < e["t"] < lim["t"] + BASE - TOL]
+    if window:
+        f.append(f"API requests during quota backoff: {[(e['p'], e['t']) for e in window]}")
+    after = [e for e in api if e["t"] >= lim["t"] + BASE - TOL][:1]
+    if not after or after[0]["p"] != "/status":
+        f.append(f"first request after backoff must be the /status probe, not auth: {[e['p'] for e in after]}")
+    elif after[0].get("auth") != "expired":
+        f.append("probe should have used the expired token (no proactive refresh while recovery is unverified)")
+    check_backoff_spacing(api, [lim["t"]], f, label="proactive-refresh quota")
+    _check_reactive_replay(api, f, "post-backoff")
+    cmds = [e for e in api if e["p"] in COMMAND_PATHS]
+    if cmds:
+        f.append(f"command reached the API: {[(e['p'], e['t']) for e in cmds]}")
+    if bridge_log.count("command NOT sent") != 1:
+        f.append(f"expected 1 locally refused command, saw {bridge_log.count('command NOT sent')}")
+    run1 = [e for e in api if e["t"] <= meta.get("run1_end_t", 1e9)]
+    if len(_by_path(run1, "/refresh")) != 2:
+        f.append(f"expected 2 /refresh in run 1 (1 limited, 1 reactive), saw {[e['t'] for e in _by_path(run1, '/refresh')]}")
+    if len(_by_path(api, "/login")) != 2:
+        f.append(f"expected 2 logins (one per boot), saw {len(_by_path(api, '/login'))}")
+    if "Proactive token refresh deferred" not in bridge_log:
+        f.append("log line 'Proactive token refresh deferred' missing")
+    # evidence: persisted and published, before and after restart
+    eps = meta.get("persisted_episodes") or []
+    idx = api.index(lim) + 1
+    if len(eps) != 1:
+        f.append(f"expected 1 persisted episode, saw {len(eps)}")
+    else:
+        ep = eps[0]
+        first, rec = ep.get("first_rejection"), ep.get("recovery")
+        if not first or first.get("reason_class") != "quota_message":
+            f.append(f"persisted first_rejection {first}")
+        elif first["rolling_24h"]["attempted"] != idx:
+            f.append(f"first_rejection counted {first['rolling_24h']['attempted']} attempted requests, stub saw {idx}")
+        if not rec or rec.get("rejected_responses_in_episode") != 1:
+            f.append(f"persisted recovery {rec}")
+    diags = diagnostics(mqtt)
+    last = diags[-1] if diags else {}
+    published = (last.get("rate_limit") or {}).get("episodes") or []
+    if len(published) != 1 or published[0].get("recovery") is None:
+        f.append(f"published episodes after restart: {published}")
+    _check_ledger_continuity(diags, f)
+    _check_persisted_ledger(api, meta, f)
+    return f
+
+
 def main(argv):
     scenario, out = argv[1].upper(), pathlib.Path(argv[2])
     read = lambda n: (out / n).read_text(encoding="utf-8", errors="replace") if (out / n).exists() else ""  # noqa: E731
@@ -206,7 +448,11 @@ def main(argv):
     supervisor = parse_json_lines(read("supervisor.log"))
     mqtt = parse_mqtt(read("mqtt.log"))
     meta = json.loads(read("meta.json") or "{}")
-    if scenario == "A":
+    jwt_checks = {"C": check_scenario_c, "D": check_scenario_d, "F": check_scenario_f, "G": check_scenario_g}
+    if scenario in jwt_checks:
+        log = read("bridge.log") + "\n--- SECOND START ---\n" + read("bridge2.log")
+        failures = jwt_checks[scenario](api, log, mqtt, supervisor, meta)
+    elif scenario == "A":
         failures = check_scenario_a(api, read("bridge.log"), mqtt, supervisor, meta)
     else:
         log = read("bridge.log") + "\n--- SECOND START ---\n" + read("bridge2.log")

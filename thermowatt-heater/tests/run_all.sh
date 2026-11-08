@@ -1,7 +1,7 @@
 #!/bin/bash
 # Reproducible clean-environment run of the whole bridge test suite (issue #17 / PR #21).
 #   usage: thermowatt-heater/tests/run_all.sh            # unit + real-bashio startup tests
-#          RUN_DOCKER_E2E=1 thermowatt-heater/tests/run_all.sh   # also the Docker e2e (needs Docker, ~20 min)
+#          RUN_DOCKER_E2E=1 thermowatt-heater/tests/run_all.sh   # also the Docker e2e (needs Docker; ~7-10 min per scenario, set E2E_SCENARIOS="C D" to choose)
 # Creates a throwaway venv and a throwaway bashio download under a fresh temp dir; nothing
 # outside it is modified. Needs: bash, python3 >= 3.12 with venv, curl, tar, sha256sum.
 set -euo pipefail
@@ -21,5 +21,5 @@ cd "$ADDON"
 if [ "${RUN_DOCKER_E2E:-0}" = 1 ]; then
   cd "$HERE/e2e"
   ./build_image.sh HEAD thermowatt-pr16:test
-  ./run_e2e.sh a A && ./run_e2e.sh b B
+  for sc in ${E2E_SCENARIOS:-A B C D F G}; do ./run_e2e.sh "$(echo "$sc" | tr 'A-Z' 'a-z')" "$sc"; done
 fi
