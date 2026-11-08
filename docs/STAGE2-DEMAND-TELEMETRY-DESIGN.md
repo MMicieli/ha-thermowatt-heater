@@ -31,7 +31,7 @@ Constraints that must not be weakened:
    - One bounded transport retry after 5 s **only** for a transport failure (e.g. `RemoteDisconnected`); never for a quota response, never more than one.
    - The result is published in the diagnostics as `refresh: {id, status: ok|failed|rate_limited|coalesced|spaced, completed_at}`. No Package 19 change is needed to read it.
 2. **Background poll.** The scheduled poll becomes configurable (`background_poll_interval`, default **60 s until Stage 2 is qualified**, target 300 s) and is skipped when a successful poll (demand or background) happened within half the interval, so the demand refresh doubles as the background poll.
-3. **Availability by age, not by failure count.** Today the device is marked offline after 5 consecutive failed polls (about 5 minutes at 60 s). At a 300 s cadence the same count would mean about 25 minutes of possibly stale "heating on" data. The bridge must therefore mark the device offline when `now - last_successful_poll > 300 s` (cadence-independent), preserving today's worst-case stale-data exposure. This is the most important invariant of the design (see "Why the bridge-side offline threshold is mandatory").
+3. **Availability by age, not by failure count.** Today the device is marked offline after 5 consecutive failed polls (about 5 minutes at 60 s). At a 300 s cadence the same count would mean about 25 minutes of possibly stale "heating on" data. The bridge must therefore mark the device offline when `now - last_successful_poll > 300 s` (cadence-independent), preserving today's worst-case stale-data exposure. This is the most important invariant of the design (see section 4.1, which also compares it with a Package 19 guard).
 4. **Proactive token refresh margin scales with cadence**: `margin = max(120 s, background_interval + 60 s)`, so a 300 s cadence never lets a token expire between polls (which would revert to the 3-request reactive sequence).
 5. **Counters.** The Stage 1 ledger gains a `demand` attribution so the evidence shows how many requests were demand-triggered versus background versus commands.
 6. **Unchanged:** command path, cooldown, confirmation window and 20 s fast polling, rate-limit backoff and persistence, command rejection while limited, no queue/replay.
@@ -72,9 +72,27 @@ The 120 s guard is unchanged and is satisfied by construction when refresh #1 or
 | **Package 18 / Sigenergy** | No change to Package 18's trigger, runner, timeout, event or gates. The new automation is independent and never waits on or blocks it. |
 | **Duplicate or rapid refresh requests** | Coalesced / spaced (10 s) by the bridge. |
 
-### Why the bridge-side offline threshold is mandatory
+### 4.1 Ownership-on freshness: bridge-side age availability vs an explicit Package 19 guard
 
-With ownership on, `binary_sensor.ems_hws_current_action_available` is just `heating_state == 'on'` with no age test. Today that is safe only because the bridge flips the entities to `unavailable` after five failed 60 s polls (about 5 minutes). If the cadence became 300 s without changing that rule, stale "heating on" could persist for about 25 minutes. A time-based threshold (section 2.1, item 3) keeps the worst-case exposure at about 5 minutes. Alternatively the ownership-on branch could gain an explicit age test in Package 19; that is a Package 19 change and needs a separate review. The bridge change is preferred because it keeps every consumer safe.
+**The gap.** With ownership on, `binary_sensor.ems_hws_current_action_available` is just `heating_state == 'on'` with no age test (the 120 s test applies only to acquisition). Today stale "heating on" is bounded only because the bridge makes the entities `unavailable` after five failed 60 s polls (about 5 minutes). A 300 s background cadence with the failure-count rule unchanged would stretch that to about 25 minutes. Some bound is therefore a precondition of Stage 2.
+
+| | **A. Bridge: unavailable when `now - last_successful_poll > 300 s`** | **B. Package 19: explicit age test in the ownership-on branch** |
+|---|---|---|
+| Covers | every consumer (dashboard, acquisition, ownership-on, handback wait, restart handback) | only the one template |
+| Bound on stale "heating on" | 300 s, equal to today's worst case | whatever threshold is chosen |
+| Deploy order | bridge first or together; protects even if Package 19 is untouched | inert until the bridge cadence changes; never protects other consumers |
+| Failure of its own input | none (uses the bridge's own clock) | depends on parsing the `last_successful_poll` attribute in Jinja; unparsable must fail closed **without** touching ownership |
+| Test level | Python unit tests against the real bridge | Jinja replay only; lives in another repository and needs a reviewed PR plus separate operator approval |
+| Behaviour on a dual refresh failure (about 0.6 % of cycles, about 2 a day at 8 % per-attempt failure) | tolerated up to 300 s: no churn | at a threshold below 300 s, `available` turns off, EMHASS deselects and the handback script starts a baseline restore through a cloud that just failed twice: avoidable commands, cooldown and 70 °C-to-baseline churn. At a threshold of 300 s it only duplicates A |
+| Cost | one bounded state-machine change plus an `unavailable` transition when data ages | one more Jinja condition to keep consistent with the 120 s acquisition test |
+
+**Recommendation.** A is the required, primary bound; B is not added by default. B is only worth adding if the qualification replay shows a residual hazard that A does not cover, and then at a threshold no tighter than A's, because a tighter guard buys churn rather than safety (the native thermostat is the physical limit at 70 °C either way). If B is later adopted it is a separate Package 19 commit with its own replay, never bundled with the bridge change.
+
+**What neither option may change (handback and native-mode authority).**
+- Ownership clears only on a confirmed baseline restore or a recognised native non-Manual mode, exactly as today. Stale or `unavailable` data is **not** a native mode: it must retain ownership and the captured baseline (the same path as a cloud outage in 1.8.0, so this is not a new case; to be re-verified in Package 19 at implementation time).
+- While data is unavailable, native mode changes cannot be observed. They are recognised on the first fresh sample after recovery, and every temperature write still re-reads the mode immediately before writing.
+- The handback script's pre-write refresh runs before any freshness verdict is applied to a write, so a stale background reading can never block the refresh that would make it fresh.
+- A guard must never be the reason ownership is released, and never the reason a baseline restore is skipped.
 
 ## 5. Expected request volume (no vendor quota assumed)
 
@@ -109,7 +127,7 @@ Each step is independently reversible: disable the Home Assistant refresh automa
 
 ## 8. Decisions for the operator (not assumed here)
 
-- Whether the age-based offline threshold should live in the bridge (recommended) or whether Package 19's ownership-on branch should gain its own age test.
+- Confirm A (bridge-side age availability, section 4.1) as the sole ownership-on bound, or ask for B (a Package 19 ownership-on age test, at a threshold no tighter than 300 s) as a second layer.
 - Background interval target (300 s versus 600 s) after Stage 1 evidence.
 - Whether to add the handback pre-write refresh (recommended) given it touches `script.hws_thermowatt_handback`.
 

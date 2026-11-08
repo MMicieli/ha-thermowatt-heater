@@ -57,6 +57,8 @@ def clock(monkeypatch):
 @pytest.fixture
 def bridge(tmp_path, monkeypatch, clock):
     monkeypatch.setattr(bridge_module, "CONFIG_FILE", str(tmp_path / "config.json"))
+    # The feature is default-OFF (see test_proactive_config.py); these tests exercise it enabled.
+    monkeypatch.setattr(MyThermowattBridge, "PROACTIVE_REFRESH", True)
     with patch("thermowatt_bridge.mqtt.Client") as mock_client:
         mqtt_client = MagicMock()
         mock_client.return_value = mqtt_client
@@ -209,8 +211,7 @@ class TestWhenItRefreshes:
         bridge._run_poll_cycle()
         bridge.refresh_session.assert_not_called()
 
-    def test_default_is_enabled(self):
-        assert MyThermowattBridge.PROACTIVE_REFRESH is True
+    def test_margin_constant(self):
         assert MyThermowattBridge.PROACTIVE_REFRESH_MARGIN_S == 120
 
 

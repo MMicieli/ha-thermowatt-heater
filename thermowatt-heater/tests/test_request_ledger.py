@@ -151,7 +151,7 @@ class TestRollingLedger:
         for key in ("day", "status", "command", "auth", "other", "total",
                     "rate_limited_responses", "blocked"):
             assert key in diag
-        assert diag["since_recovery"]["sent"] == 1
+        assert diag["since_recovery"]["attempted"] == 1
 
 
 # ───────────────────────────── persistence ─────────────────────────────
@@ -165,7 +165,7 @@ class TestPersistence:
         restarted = _restart(tmp_path, monkeypatch)
         r = _rolling(restarted)
         assert (r["status"], r["auth"], r["total"]) == (7, 1, 8)
-        assert restarted._requests_diagnostics()["since_recovery"]["sent"] == 8
+        assert restarted._requests_diagnostics()["since_recovery"]["attempted"] == 8
         assert restarted._ledger_since_ts == T0
 
     def test_restart_keeps_window_aging(self, bridge, clock, tmp_path, monkeypatch):
@@ -231,7 +231,7 @@ class TestQuotaEpisodes:
         assert first["utc_day_counters"]["status"] == 6 and first["utc_day_counters"]["auth"] == 1
         assert first["rolling_24h"]["total"] == 7
         assert first["rolling_24h"]["rate_limited_responses"] == 1
-        assert first["since_recovery"]["sent"] == 7
+        assert first["since_recovery"]["attempted"] == 7
 
     def test_http_429_reason_class(self, bridge):
         r = _resp(429, None)
@@ -273,9 +273,9 @@ class TestQuotaEpisodes:
         assert rec["at"] == bridge._isoformat_epoch(T0 + 4000)
         assert rec["episode_duration_s"] == 4000.0
         assert rec["rejected_responses_in_episode"] == 1
-        assert rec["sent_after_first_rejection"] == 1
-        assert rec["since_recovery"]["sent"] == 4
-        assert bridge._requests_diagnostics()["since_recovery"]["sent"] == 0
+        assert rec["attempted_after_first_rejection"] == 1
+        assert rec["since_recovery"]["attempted"] == 4
+        assert bridge._requests_diagnostics()["since_recovery"]["attempted"] == 0
         # A second clear is a no-op and must not rewrite the evidence.
         frozen = json.dumps(ep, sort_keys=True)
         assert bridge._clear_rate_limit(bridge._rate_limit_gen()) is False
@@ -303,7 +303,7 @@ class TestQuotaEpisodes:
         self._reject(bridge)
         eps = _episodes(bridge)
         assert [e["id"] for e in eps] == [1, 2]
-        assert eps[1]["first_rejection"]["since_recovery"]["sent"] == 2
+        assert eps[1]["first_rejection"]["since_recovery"]["attempted"] == 2
         assert eps[1]["recovery"] is None
 
     def test_history_is_capped(self, bridge, clock):
@@ -345,7 +345,7 @@ class TestQuotaEpisodes:
         (ep,) = _episodes(bridge)
         assert ep["first_rejection"] is None
         assert ep["recovery"]["episode_duration_s"] is None
-        assert ep["recovery"]["sent_after_first_rejection"] is None
+        assert ep["recovery"]["attempted_after_first_rejection"] is None
 
     def test_clearing_a_limit_with_no_open_episode_never_rewrites_a_closed_one(self, bridge, clock):
         self._reject(bridge)

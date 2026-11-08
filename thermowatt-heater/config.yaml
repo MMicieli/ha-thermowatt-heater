@@ -11,10 +11,12 @@ options:
   email: ""
   password: ""
   element_wattage: 3000
+  proactive_token_refresh: false
 schema:
   email: str
   password: password
   element_wattage: int
+  proactive_token_refresh: bool?
 mqtt: true
 services:
   - mqtt:need

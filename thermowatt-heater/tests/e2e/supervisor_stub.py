@@ -42,4 +42,4 @@ class Handler(BaseHTTPRequestHandler):
 
 
 print("supervisor stub ready", flush=True)
-ThreadingHTTPServer(("0.0.0.0", 80), Handler).serve_forever()
+ThreadingHTTPServer(("0.0.0.0", int(os.environ.get("STUB_PORT", "80"))), Handler).serve_forever()
