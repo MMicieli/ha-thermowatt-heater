@@ -1,5 +1,6 @@
 import sys, json, time, uuid, os, signal, threading, requests, urllib3, datetime, builtins, base64, math, re, contextlib
 import paho.mqtt.client as mqtt
+from requests.adapters import HTTPAdapter
 from paho.mqtt.enums import CallbackAPIVersion
 
 _ORIGINAL_PRINT = builtins.print
@@ -33,6 +34,14 @@ AVAILABILITY_TOPIC = "thermowatt/bridge/status"
 
 # HTTP timeouts — (connect_timeout, read_timeout) in seconds.
 HTTP_TIMEOUT = (5, 15)
+
+# A pooled keep-alive connection idle for longer than this is discarded before the next
+# request, so a poll never reuses a socket that an intermediary may already have closed
+# (issue #23: a background poll every ~60 s was hitting exactly that window and failing with
+# RemoteDisconnected). Must stay below the smallest plausible server/load-balancer idle
+# timeout (60 s is a common default) and above the 20 s command-confirmation and 5 s retry
+# spacing, which keep reusing the connection.
+HTTP_MAX_IDLE_S = 30
 
 
 def _load_element_wattage() -> int:
@@ -88,6 +97,35 @@ KNOWN_CMD_FAMILIES = {
     16: "Auto",
     64: "Holiday",
 }
+
+
+class _IdleSafeAdapter(HTTPAdapter):
+    """HTTPAdapter that never reuses a pooled connection idle for more than ``max_idle_s``.
+
+    urllib3 only drops a pooled connection it has already seen closed. If the peer closed it
+    just before the next request is sent (its FIN still in flight), the request is written to
+    a dead socket and fails with ``RemoteDisconnected`` without any response. Clearing the
+    pools when the adapter has been idle that long forces a fresh connection instead, with no
+    extra request and no retry. Cookies and headers live on the ``requests.Session``, not on
+    the TCP connection, so authentication and load-balancer cookies are unaffected.
+
+    Not thread-safe by itself: every caller holds ``MyThermowattBridge._http_lock``.
+    """
+
+    def __init__(self, max_idle_s, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_idle_s = max_idle_s
+        self._last_done = None  # time.monotonic() when the previous request finished
+
+    def send(self, request, **kwargs):
+        if self._last_done is not None and time.monotonic() - self._last_done > self.max_idle_s:
+            self.poolmanager.clear()
+            for manager in self.proxy_manager.values():
+                manager.clear()
+        try:
+            return super().send(request, **kwargs)
+        finally:
+            self._last_done = time.monotonic()
 
 
 class RateLimitedError(Exception):
@@ -206,6 +244,11 @@ class MyThermowattBridge:
 
         # Single session instance — preserves cookies from AWS load balancers
         self.session = requests.Session()
+        _adapter = _IdleSafeAdapter(HTTP_MAX_IDLE_S)
+        self.session.mount("https://", _adapter)
+        self.session.mount("http://", _adapter)  # same behaviour for any non-TLS endpoint
+        print(f"[HTTP] Idle-connection guard active: pooled connections idle > {HTTP_MAX_IDLE_S} s "
+              "are discarded before reuse (issue #23)")
 
         self.mqtt_client = mqtt.Client(CallbackAPIVersion.VERSION2)
         self.mqtt_client.will_set(AVAILABILITY_TOPIC, "offline", retain=True)
