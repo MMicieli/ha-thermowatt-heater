@@ -138,12 +138,49 @@ def test_fresh_success_is_reported_as_satisfying_the_request(bridge, capsys):
     assert "gave fresh telemetry" in out and "no fresh" not in out
 
 
-def test_transport_failure_retries_once_never_twice(bridge):
+def _json_resp(code=200, body=None):
+    r = MagicMock(status_code=code)
+    r.json.return_value = body if body is not None else {}
+    return r
+
+
+GOOD = {"result": {"WaterHeaterSts": 1, "T_Avg": 55.0, "T_SetPoint": 60.0, "Cmd": 9}}
+
+
+def _polls(bridge, session_effect):
+    """Real request()/poll_status(); only the HTTP session is replaced."""
     bridge.DEMAND_RETRY_DELAY = 0
-    bridge.poll_status = MagicMock(return_value=(False, None))
+    bridge.session.request = MagicMock(side_effect=session_effect)
     bridge.on_mqtt_message(None, None, msg())
-    bridge._run_poll_cycle()
-    assert bridge.poll_status.call_count == 2
+    with patch.object(bridge, "_save_config"):
+        bridge._run_poll_cycle()
+    return bridge.session.request.call_count
+
+
+def test_real_transport_failures_retry_exactly_once(bridge):
+    import requests
+    assert _polls(bridge, requests.Timeout("read timed out")) == 2
+    bridge._last_status_attempt.clear()
+    assert _polls(bridge, requests.ConnectionError("reset")) == 2
+
+
+def test_answered_invalid_200_is_not_retried(bridge):
+    assert _polls(bridge, lambda *a, **k: _json_resp(200, {"success": True, "result": {}})) == 1
+
+
+def test_answered_http_error_is_not_retried(bridge):
+    bridge.login = MagicMock()
+    assert _polls(bridge, lambda *a, **k: _json_resp(503)) == 1
+
+
+def test_local_publish_failure_after_a_valid_response_is_not_retried(bridge):
+    bridge.mqtt_client.publish.side_effect = RuntimeError("mqtt down")
+    assert _polls(bridge, lambda *a, **k: _json_resp(200, GOOD)) == 1
+
+
+def test_explicit_quota_response_is_not_retried(bridge):
+    assert _polls(bridge, lambda *a, **k: _json_resp(
+        200, {"success": False, "error": "Daily request limit exceeded"})) == 1
 
 
 def test_http_error_or_quota_response_is_not_retried(bridge):

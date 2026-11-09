@@ -366,31 +366,42 @@ def check_scenario_d(api, bridge_log, mqtt, supervisor, meta):
 
 
 def check_scenario_h(api, bridge_log, mqtt, supervisor, meta):
-    """Stage 2: poll_interval=120 (option), a retained refresh before start, then a burst of 5
-    refresh messages at ~40 s. Expect exactly 3 /status requests: boot, ONE coalesced demand
-    poll, and the next background poll one full interval after the demand poll."""
+    """Stage 2 at the intended 300 s cadence: retained refresh before start (ignored), burst of 5
+    refresh messages at ~40 s (one coalesced poll), quota window 300-400 s. Expect /status at
+    boot, +40 (demand), +340 (rejected: 300 s after the demand poll), +460 (recovery probe, ok);
+    availability offline (restart) -> online (first poll) -> offline (fixed 300 s without a poll)
+    -> online (recovery); nothing sent during the backoff."""
     f = _jwt_common(api, bridge_log, mqtt, supervisor, meta, flag_expected=False)
-    if "poll interval option: 120" not in bridge_log or "background=120s" not in bridge_log:
-        f.append("run.sh/bridge did not report the 120 s background interval option")
+    if "poll interval option: 300" not in bridge_log or "background=300s" not in bridge_log:
+        f.append("run.sh/bridge did not report the 300 s background interval option")
     status = _by_path(api, "/status")
-    if len(status) != 3:
-        f.append(f"expected exactly 3 /status requests (boot, 1 demand, 1 background), saw {[e['t'] for e in status]}")
+    if len(status) != 4:
+        f.append(f"expected exactly 4 /status requests (boot, 1 demand, 1 rejected background, 1 probe), saw {[e['t'] for e in status]}")
     else:
         t0 = status[0]["t"]
         if not 38 - TOL <= status[1]["t"] - t0 <= 48 + TOL:
             f.append(f"demand poll at +{status[1]['t'] - t0:.1f}s, expected about +40 s (retained or burst misbehaviour)")
-        if not 120 - TOL <= status[2]["t"] - status[1]["t"] <= 120 + 2 * TOL:
-            f.append(f"background poll {status[2]['t'] - status[1]['t']:.1f}s after the demand poll, expected about 120 s")
+        if not 300 - TOL <= status[2]["t"] - status[1]["t"] <= 300 + 2 * TOL:
+            f.append(f"background poll {status[2]['t'] - status[1]['t']:.1f}s after the demand poll, expected about 300 s")
+        if not status[2].get("limited") or status[0].get("limited") or status[1].get("limited") or status[3].get("limited"):
+            f.append("only the third /status should hit the quota window")
+        if not BASE - TOL <= status[3]["t"] - status[2]["t"] <= BASE + 2 * TOL:
+            f.append(f"recovery probe {status[3]['t'] - status[2]['t']:.1f}s after the rejection, expected the {BASE} s first backoff step")
     for path in ("/refresh",) + tuple(COMMAND_PATHS):
         if _by_path(api, path):
             f.append(f"unexpected {path} request: demand refresh must be read-only status polling")
     if len(_by_path(api, "/login")) != 1:
         f.append(f"expected 1 login, saw {len(_by_path(api, '/login'))}")
     intervals = {d.get("poll_interval") for d in diagnostics(mqtt)}
-    if intervals != {120}:
-        f.append(f"diagnostics poll_interval values {sorted(map(str, intervals))}, expected only 120")
-    if any(p == "offline" for t, p in mqtt if t == "P/STUBSN1/availability"):
-        f.append("device published offline although every poll succeeded")
+    # 300 normally; the existing backoff shows its own wait (BASE) while limited.
+    if not intervals <= {300, BASE} or 300 not in intervals:
+        f.append(f"diagnostics poll_interval values {sorted(map(str, intervals))}, expected 300 (and {BASE} during the backoff)")
+    seq = []
+    for topic, payload in mqtt:
+        if topic == "P/STUBSN1/availability" and (not seq or seq[-1] != payload):
+            seq.append(payload)
+    if seq != ["offline", "online", "offline", "online"]:
+        f.append(f"availability sequence {seq}, expected offline (start), online (first poll), offline (300 s), online (recovery)")
     return f
 
 

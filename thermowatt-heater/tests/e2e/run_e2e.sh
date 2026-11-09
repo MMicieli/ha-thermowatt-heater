@@ -32,7 +32,8 @@ docker run -d --name $NET-mqtt --network $NET --network-alias mqtt -v "$D/$OUT/m
 #   D  option ABSENT (an existing install's config), 300 s tokens: reactive 401 -> refresh -> replay only
 #   F  proactive ON, first /refresh answered HTTP 500: one failed attempt, then the reactive fallback
 #   G  proactive ON, 150 s tokens, quota window 30-100 s: no auth/command traffic during backoff, restart evidence
-#   H  Stage 2: poll_interval=120, retained refresh ignored, burst of refresh requests -> one status poll (opaque tokens)
+#   H  Stage 2: poll_interval=300, retained refresh ignored, burst of refresh requests -> one status poll, quota window
+#      300-400 s: offline after 300 s without a poll, no request during backoff, online after recovery (opaque tokens)
 JWT_ENV=""
 case "$SCEN" in
   A) LF=90; LU=330; ST=200 ;;
@@ -40,7 +41,7 @@ case "$SCEN" in
   C|D) LF=-1; LU=-1; ST=200; JWT_ENV="-e JWT_LIFETIME=300" ;;
   F)   LF=-1; LU=-1; ST=200; JWT_ENV="-e JWT_LIFETIME=300 -e REFRESH_FAIL_FIRST=1" ;;
   G)   LF=30; LU=100; ST=200; JWT_ENV="-e JWT_LIFETIME=150" ;;
-  H)   LF=-1; LU=-1; ST=200 ;;
+  H)   LF=300; LU=400; ST=200 ;;
   *) echo "unknown scenario $SCEN (A|B|C|D|F|G|H)"; exit 2 ;;
 esac
 docker run -d --name $NET-api --network $NET --network-alias myapp-connectivity.com -e LIMIT_FROM=$LF -e LIMIT_UNTIL=$LU -e LIMIT_STYLE=$ST $JWT_ENV \
@@ -49,7 +50,7 @@ docker run -d --name $NET-api --network $NET --network-alias myapp-connectivity.
 # Stub Supervisor: add-on options + MQTT service discovery (what run.sh reads through bashio)
 OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000}'
 # C, F, G enable the new option; A, B and D keep the original options (no proactive_token_refresh key).
-case "$SCEN" in H) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"poll_interval":120}' ;; esac
+case "$SCEN" in H) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"poll_interval":300}' ;; esac
 case "$SCEN" in C|F|G) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"proactive_token_refresh":true}' ;; esac
 MQ="{\"host\":\"mqtt\",\"port\":1883,\"username\":\"tw-user\",\"password\":\"$MQPASS\",\"ssl\":false,\"protocol\":\"3.1.1\"}"
 docker run -d --name $NET-sup --network $NET --network-alias supervisor -e SUPERVISOR_TOKEN=$TOKEN -e ADDON_OPTIONS_JSON="$OPTS" -e MQTT_SERVICE_JSON="$MQ" \
@@ -78,7 +79,7 @@ if [ "$SCEN" = A ]; then
   echo "{\"exit_code\": $(exit_code $NET-bridge)}" > "$META"
 elif [ "$SCEN" = H ]; then
   at 40; for i in 1 2 3 4 5; do pub P/STUBSN1/refresh 1; done   # burst: one coalesced poll
-  at 190
+  at 520
   docker stop -t 20 $NET-bridge >/dev/null
   echo "{\"exit_code\": $(exit_code $NET-bridge)}" > "$META"
 elif [ "$SCEN" = D ] || [ "$SCEN" = F ]; then

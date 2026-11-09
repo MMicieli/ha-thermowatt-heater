@@ -48,7 +48,7 @@ def _interval(value):
 
 @pytest.mark.parametrize("value,expected", [
     (None, 60), ("", 60), ("null", 60), ("abc", 60), ("300.5", 60), ("59", 60),
-    ("601", 60), ("0", 60), ("-300", 60), ("60", 60), ("300", 300), ("600", 600),
+    ("301", 60), ("600", 60), ("0", 60), ("-300", 60), ("60", 60), ("120", 120), ("300", 300),
 ])
 def test_background_interval_default_60_and_strict_range(value, expected):
     assert _interval(value) == expected
@@ -58,20 +58,30 @@ def test_option_declared_default_60_and_run_sh_exports_it():
     text = open(os.path.join(ADDON, "config.yaml")).read()
     options, schema = text.split("schema:")
     assert re.search(r"^\s+poll_interval:\s*60\s*$", options, re.M)
-    assert re.search(r"^\s+poll_interval:\s*int\(60,600\)\?\s*$", schema, re.M)
+    assert re.search(r"^\s+poll_interval:\s*int\(60,300\)\?\s*$", schema, re.M)
     assert "export THERMOWATT_POLL_INTERVAL" in open(os.path.join(ADDON, "run.sh")).read()
 
 
 def test_default_instance_matches_1_8_0(bridge):
     assert bridge.POLL_INTERVAL == 60 and bridge.current_poll_interval == 60
     assert bridge.TELEMETRY_STALE_AFTER == 120
-    assert bridge._offline_after_s() == 300
+    assert bridge.OFFLINE_AFTER_S == 300
 
 
-def test_slower_cadence_scales_labels_not_safety_constants(bridge):
+def test_slower_cadence_never_relaxes_safety_bounds(bridge):
     bridge.POLL_INTERVAL = 300
-    assert bridge._offline_after_s() == 360          # never flaps before a healthy poll
+    assert bridge.OFFLINE_AFTER_S == 300 and bridge.TELEMETRY_STALE_AFTER == 120
     assert bridge.POLL_INTERVAL_CONFIRM == 20 and bridge.CMD_COOLDOWN == 15
+
+
+def test_diagnostic_freshness_matches_package_19_at_a_slow_cadence(bridge):
+    bridge.POLL_INTERVAL = 300
+    bridge._last_successful_poll["SN"] = time.time() - 130   # stale for Package 19's 120 s gate
+    bridge._publish_diagnostics("SN")
+    import json
+    d = json.loads([c.args[1] for c in bridge.mqtt_client.publish.call_args_list
+                    if c.args[0] == "P/SN/diagnostics"][-1])
+    assert d["telemetry"]["state"] == "stale" and d["telemetry"]["stale_after_s"] == 120
 
 
 # ---- energy integration cap -----------------------------------------------
@@ -105,6 +115,7 @@ def test_energy_cap_at_default_is_unchanged_120s(bridge):
 # ---- age-based availability ---------------------------------------------------
 
 def test_offline_after_age_even_with_few_failures_and_online_on_next_valid_poll(bridge):
+    bridge._avail_state["SN"] = "online"
     bridge._last_successful_poll["SN"] = time.time() - 301
     bridge._consecutive_failures["SN"] = 1           # far below DEGRADED_THRESHOLD
     bridge._publish_diagnostics("SN")
@@ -121,27 +132,59 @@ def test_offline_after_age_even_with_few_failures_and_online_on_next_valid_poll(
 
 
 def test_not_offline_inside_the_window(bridge):
+    bridge._avail_state["SN"] = "online"
     bridge._last_successful_poll["SN"] = time.time() - 290
     bridge._publish_diagnostics("SN")
     assert _availability(bridge) == []
 
 
-def test_no_successful_poll_since_start_goes_offline_from_process_start(bridge):
-    bridge._boot_time = time.time() - 400            # nothing persisted can mark it online
+def test_slow_cadence_is_unavailable_when_the_poll_is_late_fail_closed(bridge):
+    bridge.POLL_INTERVAL = 300
+    bridge._avail_state["SN"] = "online"
+    bridge._last_successful_poll["SN"] = time.time() - 320   # unaided 300 s poll is late
     bridge._publish_diagnostics("SN")
+    assert _availability(bridge) == ["offline"]               # fixed bound is not relaxed
+
+
+def test_never_polled_since_start_is_offline_regardless_of_retained_state(bridge):
+    bridge._publish_diagnostics("SN")                          # no success yet this process
     assert _availability(bridge) == ["offline"]
+    client = MagicMock()
+    bridge.on_connect(client, None, None, 0, None)
+    pubs = [c.args[1] for c in client.publish.call_args_list if c.args[0] == "P/SN/availability"]
+    assert pubs == ["offline"]
+
+
+def test_first_valid_post_start_poll_makes_it_online_and_failed_polls_do_not(bridge):
+    bridge._avail_state["SN"] = "offline"                      # as run() publishes at start
+    bridge.request = MagicMock(return_value=_json_bad())
+    bridge.poll_status("SN")
+    assert _availability(bridge) == []                         # still offline, nothing new
+    resp = MagicMock(status_code=200)
+    resp.json.return_value = {"result": {"WaterHeaterSts": 1, "T_Avg": 55.0,
+                                         "T_SetPoint": 60.0, "Cmd": 9}}
+    with patch.object(bridge, "request", return_value=resp), patch.object(bridge, "_save_config"):
+        bridge.poll_status("SN")
+    assert _availability(bridge) == ["online"]
+
+
+def _json_bad():
+    r = MagicMock(status_code=200)
+    r.json.return_value = {"success": True, "result": {}}
+    return r
 
 
 def test_reconnect_does_not_republish_online_for_aged_out_device(bridge):
     bridge._last_successful_poll["SN"] = time.time() - 1000
     client = MagicMock()
     bridge.on_connect(client, None, None, 0, None)
-    pubs = [c.args for c in client.publish.call_args_list if c.args[0] == "P/SN/availability"]
-    assert pubs == [("P/SN/availability", "offline")] or pubs[0][1] == "offline"
+    pubs = [c.args[1] for c in client.publish.call_args_list if c.args[0] == "P/SN/availability"]
+    assert pubs == ["offline"]
 
 
 def test_existing_loop_wakes_to_mark_offline_without_a_poll_or_request(bridge):
     bridge.request = MagicMock()
+    bridge._avail_state["SN"] = "online"
     bridge._last_successful_poll["SN"] = time.time() - 299.8
     t0 = time.time()
     bridge._wait_for_next_poll(1.5)
@@ -155,17 +198,11 @@ def test_offline_is_evaluated_during_quota_backoff_with_no_request(bridge):
     bridge.DIAG_REFRESH_INTERVAL = 0.1
     bridge.rate_limit_backoff = 1
     bridge._rate_limit_until = time.time() + 0.6
+    bridge._avail_state["SN"] = "online"
     bridge._last_successful_poll["SN"] = time.time() - 400
     bridge._wait_for_next_poll(0.2)
     assert _availability(bridge) == ["offline"]
     bridge.request.assert_not_called()
-
-
-def test_slow_cadence_healthy_device_does_not_flap(bridge):
-    bridge.POLL_INTERVAL = 300
-    bridge._last_successful_poll["SN"] = time.time() - 320   # just before the next poll
-    bridge._publish_diagnostics("SN")
-    assert _availability(bridge) == []
 
 
 # ---- proactive refresh margin follows the cadence ----------------------------
@@ -184,3 +221,15 @@ def test_proactive_refresh_margin_covers_a_slow_cycle(bridge, monkeypatch):
     bridge.POLL_INTERVAL = 300
     bridge._maybe_proactive_refresh()
     assert bridge.refresh_session.call_count == 1
+
+
+def test_boot_publishes_offline_never_online_before_the_first_valid_poll(bridge, monkeypatch):
+    monkeypatch.setattr(module, "EMAIL", "e")
+    monkeypatch.setattr(module, "PASSWORD", "p")
+    bridge._boot_authenticate_and_discover = MagicMock(return_value=[{"seriale": "SN", "nome": "HWS"}])
+    bridge.publish_discovery = MagicMock()
+    bridge._run_poll_cycle = MagicMock(side_effect=KeyboardInterrupt)   # stop before any poll
+    with patch.object(bridge, "_save_config"):
+        bridge.run()
+    assert _availability(bridge) == ["offline"]
+    assert bridge._avail_state["SN"] == "offline"

@@ -205,6 +205,8 @@ class TestPollFailureDegraded:
     def test_no_offline_before_threshold(self, bridge):
         sn = "SN_NOFF"
         bridge.config["devices"][sn] = {"name": "Test", "last_setpoint": 60}
+        bridge._last_successful_poll[sn] = time.time()   # was online: it had polled successfully
+        bridge._avail_state[sn] = "online"
         threshold = bridge.DEGRADED_THRESHOLD
         self._poll_n(bridge, sn, threshold - 1, _fail_resp())
         assert not _offline_calls(bridge, sn)
@@ -252,6 +254,8 @@ class TestPollFailureDegraded:
         sn = "SN_NON"
         bridge.config["devices"][sn] = {"name": "Test", "last_setpoint": 60}
         bridge._consecutive_failures[sn] = 2  # below threshold
+        bridge._last_successful_poll[sn] = time.time()   # was online: it had polled successfully
+        bridge._avail_state[sn] = "online"
 
         with patch.object(bridge, "request", return_value=_success_resp()), \
              patch.object(bridge, "_save_config"):

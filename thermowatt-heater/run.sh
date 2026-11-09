@@ -17,7 +17,7 @@ fi
 export THERMOWATT_PROACTIVE_REFRESH
 
 # Background poll interval in seconds. Absent/"null" is left to the bridge, which
-# falls back to 60 s (also rejecting anything outside 60-600).
+# falls back to 60 s (also rejecting anything outside 60-300).
 THERMOWATT_POLL_INTERVAL="$(bashio::config 'poll_interval')"
 export THERMOWATT_POLL_INTERVAL
 

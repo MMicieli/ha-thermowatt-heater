@@ -18,7 +18,7 @@ schema:
   password: password
   element_wattage: int
   proactive_token_refresh: bool?
-  poll_interval: int(60,600)?
+  poll_interval: int(60,300)?
 mqtt: true
 services:
   - mqtt:need

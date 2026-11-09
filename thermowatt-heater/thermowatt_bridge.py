@@ -56,7 +56,8 @@ def _load_poll_interval() -> int:
     """Background poll interval (add-on option `poll_interval`, via run.sh).
 
     Default and fallback for anything unset, malformed or out of range is 60 s, so
-    an older saved configuration keeps today's behaviour.
+    an older saved configuration keeps today's behaviour. 300 s is the ceiling because
+    availability goes offline after a fixed 300 s without a real poll.
     """
     raw = os.getenv("THERMOWATT_POLL_INTERVAL", "60")
     try:
@@ -66,8 +67,8 @@ def _load_poll_interval() -> int:
         if str(raw).strip() not in ("", "null"):
             print(f"[WARN] Invalid THERMOWATT_POLL_INTERVAL={raw!r} — defaulting to 60 s")
         return v
-    if not (60 <= v <= 600):
-        print(f"[WARN] THERMOWATT_POLL_INTERVAL={v} out of range [60, 600] — defaulting to 60 s")
+    if not (60 <= v <= 300):
+        print(f"[WARN] THERMOWATT_POLL_INTERVAL={v} out of range [60, 300] — defaulting to 60 s")
         return 60
     return v
 
@@ -133,8 +134,8 @@ class MyThermowattBridge:
     # At the 60s normal interval this is ~5 min of cloud silence before marking degraded.
     DEGRADED_THRESHOLD = 5
     # Cadence-independent availability: offline after this long without a real
-    # successful status poll, whatever the failure count (see _offline_after_s()).
-    OFFLINE_AFTER_S = 300
+    # successful status poll, whatever the failure count and the configured cadence.
+    OFFLINE_AFTER_S = 300  # fixed: never relaxed for a slower cadence (ownership-on safety bound)
 
     # Firmware-confirmed temperature ceiling from T_set_max attribute.
     # Hardware mechanical cutout at ~90°C is independent.
@@ -218,10 +219,8 @@ class MyThermowattBridge:
         self.last_status_log_time  = time.time()
         self.rate_limit_backoff    = 0  # 0=none, 1+=consecutive rate-limit backoff steps
         self.current_poll_interval = self.POLL_INTERVAL
-        # Labels / availability must tolerate a slower background cadence.
-        self.TELEMETRY_STALE_AFTER = max(self.TELEMETRY_STALE_AFTER, self.POLL_INTERVAL + 60)
-        self._boot_time = time.time()  # availability basis until the first real poll
         self._avail_state = {}         # last published per-device availability
+        self._io = threading.local()   # per-thread: did the last I/O end without any response?
 
         # Post-command fast-poll window tracking. The event wakes the poll loop so
         # a command submitted just after a normal poll does not wait up to 60 seconds
@@ -693,6 +692,7 @@ class MyThermowattBridge:
         try:
             yield
         except Exception:
+            self._io.transport_failed = True  # lets the poll loop retry only real transport failures
             try:
                 with self._rate_limit_lock:
                     self._ledger_add_locked("transport_failed", time.time())
@@ -1686,25 +1686,21 @@ class MyThermowattBridge:
         counters["since_recovery"] = since_recovery
         return counters
 
-    def _offline_after_s(self) -> int:
-        # 300 s, but never below one background interval plus slack (else a healthy
-        # slow cadence would flap offline just before every poll).
-        return max(self.OFFLINE_AFTER_S, self.POLL_INTERVAL + 60)
-
     def _availability_for(self, serial: str, now: float) -> str:
-        """Offline after DEGRADED_THRESHOLD consecutive failures OR no real successful
-        poll within _offline_after_s(). Time basis is the last successful poll, or this
-        process's start, so nothing persisted from a previous run can mark it online."""
-        basis = self._last_successful_poll.get(serial, self._boot_time)
-        if (self._consecutive_failures.get(serial, 0) >= self.DEGRADED_THRESHOLD
-                or now - basis > self._offline_after_s()):
+        """Online only with a real successful poll since this process started, no more
+        than OFFLINE_AFTER_S (fixed, cadence-independent) old, and fewer than
+        DEGRADED_THRESHOLD consecutive failures. `_last_successful_poll` is in-memory,
+        so nothing persisted by a previous run (retained STATUS/availability) can count."""
+        ts = self._last_successful_poll.get(serial)
+        if (ts is None or now - ts > self.OFFLINE_AFTER_S
+                or self._consecutive_failures.get(serial, 0) >= self.DEGRADED_THRESHOLD):
             return "offline"
         return "online"
 
     def _update_availability(self, serial: str, now: float):
         """Publish per-device availability on change (called from every diagnostics publish)."""
         state = self._availability_for(serial, now)
-        if self._avail_state.get(serial, "online") == state:  # discovery publishes online
+        if self._avail_state.get(serial) == state:
             return
         self._avail_state[serial] = state
         try:
@@ -1716,10 +1712,8 @@ class MyThermowattBridge:
 
     def _next_offline_deadline(self):
         """Earliest time an online device would age out, for the existing wait loop."""
-        with self._config_lock:
-            serials = list(self.config.get('devices', {}).keys())
-        due = [self._last_successful_poll.get(s, self._boot_time) + self._offline_after_s()
-               for s in serials if self._avail_state.get(s, "online") != "offline"]
+        due = [ts + self.OFFLINE_AFTER_S for s, ts in list(self._last_successful_poll.items())
+               if self._avail_state.get(s) == "online"]
         return min(due) if due else None
 
     def _publish_diagnostics(self, serial: str):
@@ -2159,19 +2153,22 @@ class MyThermowattBridge:
                         continue
                 elif requested and now - last < self.current_poll_interval - 5:
                     continue  # demand wake for another device; this one is not due
-            # One bounded retry, only for a requested refresh that failed in
-            # transport. HTTP errors and quota responses are never retried.
+            # One bounded retry, only for a requested refresh whose request ended
+            # without any HTTP response (_transport_guard). Answered responses (HTTP
+            # errors, invalid 200 payloads), local processing errors and quota are never retried.
             for attempt in range(2 if serial in requested else 1):
                 if attempt:
                     time.sleep(self.DEMAND_RETRY_DELAY)
                     if self._rate_limit_remaining() > 0:
                         break
                 self._last_status_attempt[serial] = time.time()
+                self._io.transport_failed = False
                 self.poll_count += 1
                 generation = self._rate_limit_gen()  # before the request is sent
                 success, status_code = self.poll_status(serial)
-                if success or status_code is not None or self._rate_limit_remaining() > 0:
-                    break
+                if (success or not self._io.transport_failed or status_code is not None
+                        or self._rate_limit_remaining() > 0):
+                    break  # answered (even invalid), local failure or quota: never retried
                 self.error_count += 1
 
             if success:
@@ -2275,9 +2272,10 @@ class MyThermowattBridge:
                     self.config['devices'][serial]["name"] = name
                 self._save_config()
 
-            # Publish per-device availability before discovery so sensors are not
-            # immediately unavailable between config publish and first poll.
-            self.mqtt_client.publish(f"P/{serial}/availability", "online", retain=True)
+            # Fail closed across restarts: the device stays unavailable (overriding any
+            # retained "online") until the first validated post-start status poll.
+            self._avail_state[serial] = "offline"
+            self.mqtt_client.publish(f"P/{serial}/availability", "offline", retain=True)
             self.publish_discovery(serial, name)
             print(f"🌉 Bridge active for: {name} ({serial})")
 
