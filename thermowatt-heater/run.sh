@@ -16,6 +16,11 @@ else
 fi
 export THERMOWATT_PROACTIVE_REFRESH
 
+# Background poll interval in seconds. Absent/"null" is left to the bridge, which
+# falls back to 60 s (also rejecting anything outside 60-300).
+THERMOWATT_POLL_INTERVAL="$(bashio::config 'poll_interval')"
+export THERMOWATT_POLL_INTERVAL
+
 export MQTT_HOST
 export ELEMENT_WATTAGE
 export MQTT_PORT
@@ -27,6 +32,6 @@ MQTT_PORT="$(bashio::services mqtt "port")"
 MQTT_USER="$(bashio::services mqtt "username")"
 MQTT_PASSWORD="$(bashio::services mqtt "password")"
 
-bashio::log.info "Starting Thermowatt Bridge for $EMAIL (proactive token refresh: $THERMOWATT_PROACTIVE_REFRESH)..."
+bashio::log.info "Starting Thermowatt Bridge for $EMAIL (proactive token refresh: $THERMOWATT_PROACTIVE_REFRESH, poll interval option: $THERMOWATT_POLL_INTERVAL)..."
 
 python3 -u /thermowatt_bridge.py "$EMAIL" "$PASSWORD"

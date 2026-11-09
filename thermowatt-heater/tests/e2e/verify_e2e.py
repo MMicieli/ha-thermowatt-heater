@@ -1,6 +1,6 @@
 """Assertions for the stubbed container e2e (run_e2e.sh). Exits non-zero on any violation.
 
-Usage: verify_e2e.py <A|B|C|D|F|G> <out-dir>
+Usage: verify_e2e.py <A|B|C|D|F|G|H> <out-dir>
 
 A and B (rate-limit windows, opaque tokens) are unchanged. C, D, F and G use synthetic JWT access
 tokens with short controlled expiry (see stub_api.py JWT_LIFETIME) to exercise the proactive
@@ -214,7 +214,7 @@ def _jwt_common(api, bridge_log, mqtt, supervisor, meta, *, flag_expected):
     f = []
     if "Starting Thermowatt Bridge for" not in bridge_log:
         f.append("run.sh log line missing: entrypoint not exercised")
-    want = f"proactive token refresh: {1 if flag_expected else 0})"
+    want = f"proactive token refresh: {1 if flag_expected else 0}"
     if want not in bridge_log:
         f.append(f"run.sh did not report {want!r}")
     seen = {(e["p"], e.get("authed"), e.get("known")) for e in supervisor}
@@ -365,6 +365,46 @@ def check_scenario_d(api, bridge_log, mqtt, supervisor, meta):
     return f
 
 
+def check_scenario_h(api, bridge_log, mqtt, supervisor, meta):
+    """Stage 2 at the intended 300 s cadence: retained refresh before start (ignored), burst of 5
+    refresh messages at ~40 s (one coalesced poll), quota window 300-400 s. Expect /status at
+    boot, +40 (demand), +340 (rejected: 300 s after the demand poll), +460 (recovery probe, ok);
+    availability offline (restart) -> online (first poll) -> offline (fixed 300 s without a poll)
+    -> online (recovery); nothing sent during the backoff."""
+    f = _jwt_common(api, bridge_log, mqtt, supervisor, meta, flag_expected=False)
+    if "poll interval option: 300" not in bridge_log or "background=300s" not in bridge_log:
+        f.append("run.sh/bridge did not report the 300 s background interval option")
+    status = _by_path(api, "/status")
+    if len(status) != 4:
+        f.append(f"expected exactly 4 /status requests (boot, 1 demand, 1 rejected background, 1 probe), saw {[e['t'] for e in status]}")
+    else:
+        t0 = status[0]["t"]
+        if not 38 - TOL <= status[1]["t"] - t0 <= 48 + TOL:
+            f.append(f"demand poll at +{status[1]['t'] - t0:.1f}s, expected about +40 s (retained or burst misbehaviour)")
+        if not 300 - TOL <= status[2]["t"] - status[1]["t"] <= 300 + 2 * TOL:
+            f.append(f"background poll {status[2]['t'] - status[1]['t']:.1f}s after the demand poll, expected about 300 s")
+        if not status[2].get("limited") or status[0].get("limited") or status[1].get("limited") or status[3].get("limited"):
+            f.append("only the third /status should hit the quota window")
+        if not BASE - TOL <= status[3]["t"] - status[2]["t"] <= BASE + 2 * TOL:
+            f.append(f"recovery probe {status[3]['t'] - status[2]['t']:.1f}s after the rejection, expected the {BASE} s first backoff step")
+    for path in ("/refresh",) + tuple(COMMAND_PATHS):
+        if _by_path(api, path):
+            f.append(f"unexpected {path} request: demand refresh must be read-only status polling")
+    if len(_by_path(api, "/login")) != 1:
+        f.append(f"expected 1 login, saw {len(_by_path(api, '/login'))}")
+    intervals = {d.get("poll_interval") for d in diagnostics(mqtt)}
+    # 300 normally; the existing backoff shows its own wait (BASE) while limited.
+    if not intervals <= {300, BASE} or 300 not in intervals:
+        f.append(f"diagnostics poll_interval values {sorted(map(str, intervals))}, expected 300 (and {BASE} during the backoff)")
+    seq = []
+    for topic, payload in mqtt:
+        if topic == "P/STUBSN1/availability" and (not seq or seq[-1] != payload):
+            seq.append(payload)
+    if seq != ["offline", "online", "offline", "online"]:
+        f.append(f"availability sequence {seq}, expected offline (start), online (first poll), offline (300 s), online (recovery)")
+    return f
+
+
 def check_scenario_f(api, bridge_log, mqtt, supervisor, meta):
     """Proactive ON, first refresh answered HTTP 500: attempted once, then the reactive path recovers."""
     f = _jwt_common(api, bridge_log, mqtt, supervisor, meta, flag_expected=True)
@@ -448,7 +488,7 @@ def main(argv):
     supervisor = parse_json_lines(read("supervisor.log"))
     mqtt = parse_mqtt(read("mqtt.log"))
     meta = json.loads(read("meta.json") or "{}")
-    jwt_checks = {"C": check_scenario_c, "D": check_scenario_d, "F": check_scenario_f, "G": check_scenario_g}
+    jwt_checks = {"H": check_scenario_h, "C": check_scenario_c, "D": check_scenario_d, "F": check_scenario_f, "G": check_scenario_g}
     if scenario in jwt_checks:
         log = read("bridge.log") + "\n--- SECOND START ---\n" + read("bridge2.log")
         failures = jwt_checks[scenario](api, log, mqtt, supervisor, meta)

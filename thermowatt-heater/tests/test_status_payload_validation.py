@@ -13,6 +13,7 @@ import json
 import sys
 from unittest.mock import MagicMock, patch
 
+import time
 import pytest
 
 sys.argv = ["thermowatt_bridge.py"]
@@ -192,6 +193,8 @@ class TestInvalidStatusPayloadValidation:
 
     def test_no_offline_before_threshold_invalid_payloads(self, bridge):
         threshold = bridge.DEGRADED_THRESHOLD
+        bridge._last_successful_poll["SN"] = time.time()   # was online
+        bridge._avail_state["SN"] = "online"
         with patch.object(bridge, "request", return_value=_invalid_resp()):
             for _ in range(threshold - 1):
                 bridge.poll_status("SN")
