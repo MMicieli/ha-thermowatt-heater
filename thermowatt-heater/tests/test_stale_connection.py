@@ -274,3 +274,18 @@ def test_constants_cadence_and_mounting(make_bridge):
     assert isinstance(b.session.get_adapter("https://example.invalid/x"), _IdleSafeAdapter)
     assert isinstance(b.session.get_adapter("http://example.invalid/x"), _IdleSafeAdapter)
     assert b.session.get_adapter("https://a/") is b.session.get_adapter("http://b/")  # one shared idle clock
+
+
+def test_startup_logs_the_guard_so_a_candidate_build_is_identifiable(make_bridge, capsys):
+    make_bridge("http://127.0.0.1:1", GUARD_S)
+    assert "[HTTP] Idle-connection guard active: pooled connections idle > 30 s" in capsys.readouterr().out
+
+
+def test_addon_version_marks_the_candidate_and_dockerfile_pins_are_unchanged():
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = open(os.path.join(root, "config.yaml")).read()
+    assert 'version: "1.9.1-rc.1"' in cfg          # never the installed 1.9.0
+    docker = open(os.path.join(root, "Dockerfile")).read()
+    for pin in ('"requests==2.34.2"', '"urllib3==2.8.0"', '"paho-mqtt==2.2.0"'):
+        assert pin in docker

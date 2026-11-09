@@ -247,6 +247,8 @@ class MyThermowattBridge:
         _adapter = _IdleSafeAdapter(HTTP_MAX_IDLE_S)
         self.session.mount("https://", _adapter)
         self.session.mount("http://", _adapter)  # same behaviour for any non-TLS endpoint
+        print(f"[HTTP] Idle-connection guard active: pooled connections idle > {HTTP_MAX_IDLE_S} s "
+              "are discarded before reuse (issue #23)")
 
         self.mqtt_client = mqtt.Client(CallbackAPIVersion.VERSION2)
         self.mqtt_client.will_set(AVAILABILITY_TOPIC, "offline", retain=True)
