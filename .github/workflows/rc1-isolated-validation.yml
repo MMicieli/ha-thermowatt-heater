@@ -17,7 +17,7 @@ jobs:
       - name: Real production image smoke test
         run: |
           set -euo pipefail
-          ./thermowatt-heater/tests/e2e/build_image.sh HEAD thermowatt-rc1-verify:latest
+          bash ./thermowatt-heater/tests/e2e/build_image.sh HEAD thermowatt-rc1-verify:latest
           docker run --rm --entrypoint python3 thermowatt-rc1-verify:latest -c 'import sys,requests,urllib3,paho.mqtt.client; print(sys.version); print(requests.__version__,urllib3.__version__)'
       - name: Python 3.12 Alpine full test suite with pinned dependencies
         run: |
@@ -47,7 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           docker version
-          ./thermowatt-heater/tests/e2e/build_image.sh HEAD thermowatt-rc1-verify:latest
+          bash ./thermowatt-heater/tests/e2e/build_image.sh HEAD thermowatt-rc1-verify:latest
       - name: Stubbed end-to-end scenario ${{ matrix.scenario }}
         working-directory: thermowatt-heater/tests/e2e
         env:
@@ -55,4 +55,4 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x run_e2e.sh
-          ./run_e2e.sh "$(echo "${{ matrix.scenario }}" | tr '[:upper:]' '[:lower:]')" "${{ matrix.scenario }}"
+          bash ./run_e2e.sh "$(echo "${{ matrix.scenario }}" | tr '[:upper:]' '[:lower:]')" "${{ matrix.scenario }}"
