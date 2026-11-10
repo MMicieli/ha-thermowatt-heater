@@ -1,0 +1,58 @@
+name: RC1 isolated container and E2E validation
+
+on:
+  push:
+    branches: [ci/validate-rc1-chatgpt]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python312-alpine:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Real production image smoke test
+        run: |
+          set -euo pipefail
+          ./thermowatt-heater/tests/e2e/build_image.sh HEAD thermowatt-rc1-verify:latest
+          docker run --rm --entrypoint python3 thermowatt-rc1-verify:latest -c 'import sys,requests,urllib3,paho.mqtt.client; print(sys.version); print(requests.__version__,urllib3.__version__)'
+      - name: Python 3.12 Alpine full test suite with pinned dependencies
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}:/work:ro" -w /work/thermowatt-heater python:3.12-alpine sh -ec '
+            apk add --no-cache bash curl tar coreutils
+            python -m pip install --no-cache-dir "paho-mqtt==2.2.0" "requests==2.34.2" "urllib3==2.8.0" "certifi==2026.10.23" "idna==3.20" "charset-normalizer==3.5.2" "pytest>=7.0" jinja2
+            mkdir -p /tmp/tw
+            curl -fsSL https://github.com/hassio-addons/bashio/archive/refs/tags/v0.16.2.tar.gz -o /tmp/tw/bashio.tgz
+            echo "d0f0c780c4badd103c00c572b1bf9645520d15a8a8070d6e3d64e35cb9f583aa  /tmp/tw/bashio.tgz" | sha256sum -c -
+            tar -xzf /tmp/tw/bashio.tgz -C /tmp/tw
+            export TW_BASHIO_LIB=/tmp/tw/bashio-0.16.2/lib
+            python --version
+            python -m pytest tests -q -p no:cacheprovider -rs
+          '
+
+  docker-e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [A, B, C, D, F, G, H]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker Engine and real add-on build
+        run: |
+          set -euo pipefail
+          docker version
+          ./thermowatt-heater/tests/e2e/build_image.sh HEAD thermowatt-rc1-verify:latest
+      - name: Stubbed end-to-end scenario ${{ matrix.scenario }}
+        working-directory: thermowatt-heater/tests/e2e
+        env:
+          IMAGE: thermowatt-rc1-verify:latest
+        run: |
+          set -euo pipefail
+          chmod +x run_e2e.sh
+          ./run_e2e.sh "$(echo "${{ matrix.scenario }}" | tr '[:upper:]' '[:lower:]')" "${{ matrix.scenario }}"
