@@ -16,6 +16,18 @@ import sys
 
 TOL = 6.0
 BASE = 120  # first backoff step (s)
+# Stage 3 slow-response recovery deadline, measured from the harness event `slow_end` (derived from the bridge source):
+#  - A /status that ARRIVES before slow_end is still answered after 16 s, so the bridge's last failed attempt can end up
+#    to HTTP_TIMEOUT = (connect 5 s, read 15 s) = 20 s after slow_end (a requested refresh's retry 5 s later is already
+#    healthy and would recover sooner; the worst case is a final failure with nothing left to retry).
+#  - After a failed cycle the bridge waits the full POLL_INTERVAL (180 s) again: `_background_wait_s` only shortens the
+#    wait to the 290 s deadline poll when the last success is already >= 289 s old (here ~65 s), whether demand-aware
+#    polling is active (S: last refresh request is well inside DEMAND_ACTIVE_WINDOW_S = 660 s) or off (S0).
+#  - Plus TOL for container scheduling jitter.  => 180 + 5 + 15 + 6 = 206 s (the observed Docker runs recovered 140 s
+#    after slow_end).  The previous 90 s deadline was shorter than one poll interval and could not be met legitimately.
+STAGE3_POLL_INTERVAL_S = 180
+HTTP_CONNECT_TIMEOUT_S, HTTP_READ_TIMEOUT_S = 5, 15
+RECOVERY_DEADLINE_S = STAGE3_POLL_INTERVAL_S + HTTP_CONNECT_TIMEOUT_S + HTTP_READ_TIMEOUT_S + TOL
 COMMAND_PATHS = {"/manual", "/eco", "/auto", "/holiday", "/off"}
 ALLOWED_SUPERVISOR = {"/addons/self/options/config", "/services/mqtt"}
 SECRETS = ("stubpass-SECRET", "tw-pass-SECRET", "stub-supervisor-token-SECRET", "stub-a", "stub-r")
@@ -573,9 +585,14 @@ def check_scenario_s(api, events, bridge_log, mqtt, supervisor, meta, option_on=
         f.append(f"{tag}: no request hit the slow window: fault injection ineffective")
     if len(during) > (hi - lo) / 15.0 + 3:
         f.append(f"{tag}: {len(during)} requests in a {hi - lo:.0f} s read-timeout window (request storm)")
-    good = [e for e in _status_between(api, hi, events["recovered_check"], include_slow=False)]
+    # recovery = an actual successful (non-slow) /status poll within RECOVERY_DEADLINE_S of the end of the slow window
+    if events["recovered_check"] < hi + RECOVERY_DEADLINE_S - 1:
+        f.append(f"{tag}: harness observed recovery only until slow_end+{events['recovered_check'] - hi:.0f} s, "
+                 f"shorter than the {RECOVERY_DEADLINE_S:.0f} s deadline")
+    good = [e for e in _status_between(api, hi, hi + RECOVERY_DEADLINE_S, include_slow=False)]
     if not good:
-        f.append(f"{tag}: no successful /status within the recovery period after the slow window")
+        f.append(f"{tag}: no successful /status within {RECOVERY_DEADLINE_S:.0f} s after the slow window "
+                 f"(180 s poll interval + 20 s HTTP timeout + {TOL:.0f} s tolerance)")
     if len([e for e in api if e["p"] == "/login"]) > 1:
         f.append(f"{tag}: re-login during timeouts (timeouts must not look like auth failures)")
     diags = [(None, d) for d in diagnostics(mqtt)]

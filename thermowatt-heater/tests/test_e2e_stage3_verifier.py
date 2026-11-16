@@ -31,6 +31,10 @@ EVENTS = {"start": 1000, "reuse_precycle": 1230, "forced_1": 1380, "overlap_prec
           "quota_pub2": 2780, "limit_off": 2810, "end": 3010}
 
 
+SLOW_END_T = 615
+RECOVERY_T = 790      # slow_end + 175 s: a legitimate 180 s-cadence recovery (observed in Docker: slow_end + 140 s)
+
+
 def good(option_on=True):
     api = [e(0, "/login"), e(0, "/user-info"), e(0), e(190)]
     if not option_on:
@@ -38,8 +42,9 @@ def good(option_on=True):
     api += [e(381), e(441), e(442.5)]             # forced '1'; overlap A (1 poll + coalesced); 
     api += [e(512), e(513.5)]                     # overlap B
     api += [e(545 + 20 * i, slow=True, abs=1000 + 545 + 20 * i - 16) for i in range(3)]
-    api += [e(620)]                               # recovery
-    api += [e(710 + 180 * i) for i in range(6)]   # quiet period at the legacy 180 s cadence
+    # recovery at the bridge's 180 s fallback cadence: last failed attempt ended ~t=605 (slow_end=615), next poll ~605+180
+    api += [e(RECOVERY_T)]
+    api += [e(RECOVERY_T + 180 * i) for i in range(1, 6)]   # quiet period at the legacy 180 s cadence
     api += [e(1790, limited=True)]                # quota response, then silence for the 120 s backoff
     api += [e(1912), e(2092)]
     for x in api:
@@ -49,9 +54,10 @@ def good(option_on=True):
             pass
     ev = dict(EVENTS)
     # absolute times for the quota block: place it where the synthetic limited response is
-    ev.update({"quiet_start": 1000 + 700, "quiet_end": 1000 + 1780, "quota_start": 1000 + 1781, "quota_limited": 1000 + 1791,
+    ev.update({"quiet_start": 1000 + 705, "quiet_end": 1000 + 1780, "quota_start": 1000 + 1781, "quota_limited": 1000 + 1791,
                "quota_pub2": 1000 + 1811, "limit_off": 1000 + 1841, "end": 1000 + 2100,
-               "slow_start": 1000 + 520, "slow_forced": 1000 + 540, "slow_end": 1000 + 615, "recovered_check": 1000 + 699,
+               "slow_start": 1000 + 520, "slow_forced": 1000 + 540, "slow_end": 1000 + SLOW_END_T,
+               "recovered_check": 1000 + SLOW_END_T + 210,   # harness: slow_end + 90 + 120
                "reuse_precycle": 1000 + 230, "forced_1": 1000 + 380, "overlap_precycle_then_1": 1000 + 440,
                "overlap_1_then_precycle": 1000 + 511})
     stats = {"marked": 4, "forced": 4}
@@ -95,12 +101,54 @@ def test_request_storm_during_timeouts_and_missing_recovery_are_caught():
     api, *rest = good(True)
     storm = api + [e(545 + i, slow=True, abs=1000 + 545 + i - 16) for i in range(40)]
     assert any("storm" in m for m in run(sorted(storm, key=lambda x: x["abs"]), *rest))
-    assert any("no successful /status" in m for m in run([x for x in api if x["t"] != 620], *rest))
+    assert any("no successful /status" in m for m in run([x for x in api if x["t"] != RECOVERY_T], *rest))
+
+
+def _with_recovery_at(api, t_new):
+    """Move the single recovery poll (and drop the cadence that followed it) to slow_end + t_new - SLOW_END_T."""
+    out = [x for x in api if x["t"] != RECOVERY_T]
+    out.append(e(t_new))
+    return sorted(out, key=lambda x: x["abs"])
+
+
+def test_recovery_deadline_matches_the_documented_arithmetic():
+    assert v.RECOVERY_DEADLINE_S == 180 + 5 + 15 + v.TOL == 206.0
+
+
+def test_legitimate_180s_recovery_is_accepted_up_to_the_deadline():
+    for on in (True, False):
+        for dt in (20, 140, 175, 205):            # observed Docker recovery was 140 s after slow_end
+            api, *rest = good(on)
+            msgs = run(_with_recovery_at(api, SLOW_END_T + dt), *rest, option_on=on)
+            assert not any("no successful /status" in m for m in msgs), (on, dt, msgs)
+
+
+def test_missing_or_excessively_delayed_recovery_is_rejected():
+    for on in (True, False):
+        api, *rest = good(on)
+        assert any("no successful /status" in m for m in run([x for x in api if x["t"] != RECOVERY_T], *rest, option_on=on))
+        late = run(_with_recovery_at(api, SLOW_END_T + 207), *rest, option_on=on)    # just past 206 s
+        assert any("no successful /status" in m for m in late), on
+        far = run(_with_recovery_at(api, SLOW_END_T + 400), *rest, option_on=on)
+        assert any("no successful /status" in m for m in far), on
+
+
+def test_a_slow_response_does_not_count_as_recovery():
+    api, *rest = good(True)
+    only_slow = _with_recovery_at(api, SLOW_END_T + 60)
+    only_slow[[x["t"] for x in only_slow].index(SLOW_END_T + 60)]["slow"] = True
+    assert any("no successful /status" in m for m in run(only_slow, *rest))
+
+
+def test_harness_cannot_silently_shorten_the_observation_window():
+    api, ev, *rest = good(True)
+    ev["recovered_check"] = ev["slow_end"] + 90      # the old, too-short harness deadline
+    assert any("shorter than the 206 s deadline" in m for m in run(api, ev, *rest))
 
 
 def test_gap_over_the_offline_threshold_and_missing_legacy_cadence_are_caught():
     api, *rest = good(True)
-    api = [x for x in api if x["t"] not in (890, 1070)]            # a 540 s hole
+    api = [x for x in api if x["t"] not in (RECOVERY_T + 180, RECOVERY_T + 360)]            # a 540 s hole
     assert any("offline threshold" in m for m in run(api, *rest))
 
 

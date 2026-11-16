@@ -106,8 +106,9 @@ if [ "$SCEN" = S ] || [ "$SCEN" = S0 ]; then
   docker exec $NET-api touch /tmp/slow; ev slow_start    # /status answered after 16 s > 15 s read timeout
   wait_age 30;  ev slow_forced;     pub P/STUBSN1/refresh 1
   sleep 75;     docker exec $NET-api rm -f /tmp/slow; ev slow_end
-  sleep 90;     ev recovered_check
-  ev quiet_start; sleep 1050; ev quiet_end              # HA publishes no refreshes at all
+  sleep 90;     ev quiet_start                          # HA publishes no refreshes at all from here until quiet_end
+  sleep 120;    ev recovered_check                      # = slow_end + 210 s >= verifier RECOVERY_DEADLINE_S (206 s: 180 s poll + 20 s HTTP timeout + TOL)
+  sleep 930;    ev quiet_end                            # same absolute quiet_end as before (slow_end + 1140 s)
   docker exec $NET-api touch /tmp/limit; ev quota_start
   i=0; until docker logs $NET-api 2>&1 | grep -q '"limited": true'; do sleep 2; i=$((i+1)); [ $i -gt 200 ] && break; done
   ev quota_limited; pub P/STUBSN1/refresh 1
