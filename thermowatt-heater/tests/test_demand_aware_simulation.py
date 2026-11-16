@@ -1,6 +1,7 @@
 """Stage 3 (issue #17): 48 h virtual-time simulation of the REAL bridge scheduler against a fake
 cloud and a model of Package 19's pre-cycle refresh. Budgets here are planning targets measured in the
 model, not vendor quotas. See tests/sim_harness.py for the (stated) fidelity limits."""
+import collections
 import functools
 import math
 import statistics as st
@@ -8,7 +9,8 @@ import statistics as st
 import pytest
 
 from tests.sim_harness import DAY, T0
-from tests.sim_scenarios import deadline_fault, detection_delays, hms, native_during_boost, run
+from tests.sim_scenarios import (adversarial_handback, capped_active_day, deadline_fault, detection_delays, hms,
+                                 native_during_boost, outstanding_handback, run)
 
 
 @functools.lru_cache(maxsize=None)
@@ -156,16 +158,89 @@ def test_a_larger_reuse_threshold_would_breach_the_120s_gate_at_translation():
     assert any(g["true_age"] > 120 for g in r["gate"])             # why 80 s and not 110 s
 
 
-def test_without_the_phase_gate_the_handback_refresh_wait_starves():
-    """PR #25 head: reuse for any arrival. The handback script needs a poll stamped >= request - 10 s."""
-    broken = R("p19day10", "D", phase_gate=False, boost_rule=False)
-    outcomes = [h["outcome"] for h in broken["handbacks"]]
-    assert outcomes.count("halt_refresh_wait") >= 10
-    fixed = R("p19day10", "D")
-    legacy = R("p19day10", "L")
-    assert [h["outcome"] for h in fixed["handbacks"]] == [h["outcome"] for h in legacy["handbacks"]] == ["ok"] * 18
-    assert fixed["acquisitions"] == legacy["acquisitions"] == 18
-    assert fixed["confirmed"] == legacy["confirmed"] == 54 and not fixed["ownership_end"]
+def _count(rows, pred=lambda x: True):
+    return collections.Counter(o for ph, age, o in rows if pred((ph, age)))
+
+
+def test_arrival_phase_inference_was_unsafe_explicit_intent_is_safe():
+    """Review finding on 9f60834: ownership ON, setpoint 58 (below the boost rule), a plain "1" handback/HA-start
+    refresh arriving inside the pre-cycle phase 266-299 s with a 10-80 s old poll."""
+    inferred = adversarial_handback("D", arrival_inference=True)           # emulates the superseded head
+    in_phase = _count(inferred, lambda x: 266 <= x[0] < 299)
+    assert in_phase["halt_refresh_wait"] >= 12                              # reproduced: 16 of 40
+    assert all(age > 10 for ph, age, o in inferred if o == "halt_refresh_wait")
+    for kw in (dict(), dict(precycle_marker=False)):                       # marked P19, and today's unchanged P19
+        fixed = adversarial_handback("D", **kw)
+        assert _count(fixed) == {"ok": len(fixed)}
+    legacy = adversarial_handback("L")
+    assert _count(legacy) == {"ok": len(legacy)}
+
+
+def test_native_setpoint_50_after_a_soft_stop_is_covered_too():
+    rows = adversarial_handback("D", setpoint=50.0)
+    assert _count(rows) == {"ok": len(rows)}
+
+
+def test_overlapping_precycle_and_handback_requests_in_both_arrival_orders():
+    """Handback refresh within +-0.3 s of the pre-cycle primary (272.2 s) and retry (290.2 s) arrivals."""
+    rows = adversarial_handback("D", phases=(271.9, 272.1, 272.3, 272.5, 289.9, 290.1, 290.3, 290.5), trials_per_phase=6)
+    assert _count(rows) == {"ok": len(rows)}
+
+
+def test_ha_start_recovery_handback_at_any_phase_gets_a_real_poll():
+    from tests.sim_scenarios import World, MODES, T0 as T_0
+    import pathlib
+    import tempfile
+    outcomes = []
+    for end_offset in (242, 250, 260, 270, 285, 100):                       # recovery handback at end + 30 s
+        w = World(seed=3, days=1, **MODES["D"])
+        w.p19 = True
+        w.build(pathlib.Path(tempfile.mkdtemp()))
+        w.at(T_0 + 300 * 59 + 100, lambda w=w: setattr(w, "ownership", True) or setattr(w, "baseline", 58.0))
+        w.ha_down.append((T_0 + 300 * 60 + 2, T_0 + 300 * 60 + end_offset))
+        try:
+            w.run()
+        finally:
+            w.close()
+        outcomes.extend(h["outcome"] for h in w.handbacks if h["t"] >= T_0 + 300 * 60)
+    assert outcomes and set(outcomes) <= {"ok"}
+
+
+@pytest.mark.parametrize("kind", ["soft_stop_fail", "stale", "quota"])
+def test_outstanding_handback_is_retained_not_assumed_done_and_resolves(kind):
+    for mode in ("L", "D"):
+        r = outstanding_handback(kind, mode)
+        assert r["owned_in_window"] is True and r["setpoint_in_window"] == 70.0    # retained, heater left where it was
+        assert r["owned_end"] is False and r["setpoint_end"] == 58.0 and r["last_outcome"] == "ok"
+        assert r["commands_during_window"] <= (0 if kind != "soft_stop_fail" else 40)
+    d = outstanding_handback(kind, "D")
+    if kind == "soft_stop_fail":
+        assert "halt_soft_stop_wait" in d["outcomes"]
+    else:
+        assert d["outcomes"].count("halt_refresh_wait") >= 3
+    if kind == "quota":
+        assert d["commands_during_window"] == 0 and d["cmd_refused"] == 0   # nothing sent, nothing queued, nothing replayed
+        assert sum(d["rejected"].values()) <= 8                             # only hourly backoff probes were refused
+
+
+def test_first_rejection_during_an_owned_boost_leaves_the_handback_outstanding_until_the_quota_resets():
+    """Characterisation, not a guarantee: boosts late in the UTC day against a 469 first-rejection count."""
+    legacy = capped_active_day("L")
+    assert legacy["first_rejection_h"] < 17.5 and not legacy["owned_at_midnight"]   # rejected first: no boost starts
+    for mode in ("D", "DP"):
+        r = capped_active_day(mode)
+        assert r["first_rejection_h"] > 18                                  # fewer requests reach the cap later...
+        assert r["owned_at_midnight"] is True                               # ...inside the active boost period
+        assert r["setpoint_at_midnight"] in (50.0, 70.0)
+        assert 1.0 <= r["ownership_outstanding_h"] <= 4.0 and r["owned_end"] is False   # resolved after the reset
+        assert r["commands_refused"] == 0 and r["per_day"][0]["rejected"] <= 8
+
+
+def test_unmarked_package_19_gets_no_reuse_but_stays_safe_and_below_today():
+    r = R("p19idle", "D", precycle_marker=False)
+    assert 520 <= day(r, 0) <= 545 and day(r, 0) < 0.82 * day(R("p19idle", "L"), 0)
+    assert r["reuse"]["reused"] == 0
+    assert all(h["outcome"] == "ok" for h in R("p19day10", "D", precycle_marker=False)["handbacks"])
 
 
 def test_handback_refresh_always_gets_a_real_poll_at_every_phase():

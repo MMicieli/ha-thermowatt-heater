@@ -87,6 +87,8 @@ class FakeCloud:
         self.fail_profile = [("reset", 0.3, 1.0)]
         self.fault_hook = None            # callable(now, endpoint) -> None | ("slow", s) | (kind,) | ("quota",)
         self.slow_windows = []            # (start, end, seconds): every response takes this long
+        self.ignore_setpoints = []        # (start, end, {setpoints}): the API accepts the command (200) but does not apply it
+        self.first_reject_t = None
         self.sent = {}                   # (day, category) -> n
         self.rejected = {}               # day -> n
         self.accepted_by_day = {}        # day -> n received & counted by quota
@@ -161,6 +163,8 @@ class FakeCloud:
         self.w.clk.sleep(slow if slow is not None else self._rtt())
         if self._quota_rejects():
             self.rejected[self._day()] = self.rejected.get(self._day(), 0) + 1
+            if self.first_reject_t is None:
+                self.first_reject_t = self.w.clk.now
             return Resp(200, {"success": False, "error": "Daily request limit exceeded"})
         d = self._day()
         self.accepted_by_day[d] = self.accepted_by_day.get(d, 0) + 1
@@ -187,7 +191,9 @@ class FakeCloud:
         body = {}
         if endpoint == "/manual":
             self.heater["Cmd"] = 9
-            self.heater["T_SetPoint"] = float((self.w.last_json or {}).get("T_SetPoint", self.heater["T_SetPoint"]))
+            req = float((self.w.last_json or {}).get("T_SetPoint", self.heater["T_SetPoint"]))
+            if not any(a <= self.w.clk.now < b and req in sp for a, b, sp in self.ignore_setpoints):
+                self.heater["T_SetPoint"] = req
             self.heater_update()
         elif endpoint == "/eco":
             self.heater["Cmd"] = 3
@@ -198,7 +204,7 @@ class FakeCloud:
 
 class World:
     def __init__(self, seed=1, poll_interval=180, demand_aware=False, proactive=False,
-                 days=2, ha_enabled=True, jitter_sd=0.16, reuse_age=None, margin=None, post_delay=None):
+                 days=2, ha_enabled=True, jitter_sd=0.16, reuse_age=None, margin=None, post_delay=None, precycle_marker=True):
         self.rng = random.Random(seed)
         self.clk = Clock()
         self.end = T0 + days * DAY
@@ -229,6 +235,7 @@ class World:
         self.commands = []               # (t, topic, payload)
         self._out = io.StringIO()
         self.poll_interval = poll_interval
+        self.precycle_marker = precycle_marker   # False models today's unchanged Package 19 (plain "1")
         self.post_delay = post_delay      # None or callable(rng)->seconds spent after the status stamp (publishes, flush)
         self.cfg = dict(demand_aware=demand_aware, proactive=proactive, reuse_age=reuse_age, margin=margin)
 
@@ -373,7 +380,7 @@ class World:
             return
         self.refresh_publishes += 1
         self.b.on_mqtt_message(None, None, SimpleNamespace(
-            topic=f"P/{SN}/refresh", payload=b"1", retain=False))
+            topic=f"P/{SN}/refresh", payload=b"precycle" if self.precycle_marker else b"1", retain=False))
 
     def schedule_ha(self):
         """Package 19 pre-cycle refresh: at :30 of every minute with minute % 5 == 4 (30 s before the
@@ -546,7 +553,8 @@ class World:
             return
         self.handback_running = True
         b = self.b
-        rec = {"t": self.clk.now, "phase": (self.clk.now - T0) % 300, "outcome": None, "refresh_polled": None}
+        rec = {"t": self.clk.now, "phase": (self.clk.now - T0) % 300, "outcome": None, "refresh_polled": None,
+               "sent": sum(self.cloud.sent.values())}
         self.handbacks.append(rec)
         req = self.clk.now
         polls_before = self.cloud.sent.get((self.cloud._day(), "status"), 0)
@@ -554,6 +562,7 @@ class World:
         def finish(outcome):
             rec["outcome"] = outcome
             rec["end"] = self.clk.now
+            rec["sent_end"] = sum(self.cloud.sent.values())
             self.handback_running = False
 
         b.on_mqtt_message(None, None, SimpleNamespace(topic=f"P/{SN}/refresh", payload=b"1", retain=False))

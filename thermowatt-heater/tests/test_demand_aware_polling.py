@@ -32,7 +32,6 @@ def bridge(monkeypatch, tmp_path):
 def da(bridge):
     """Demand-aware ON at the production interval, with HA actively requesting."""
     bridge.DEMAND_AWARE_FLAG = True
-    bridge.DEMAND_REUSE_PHASE_S = None       # phase gate has its own tests below; real clock here
     bridge.POLL_INTERVAL = 180
     bridge.current_poll_interval = 180
     bridge._last_demand_at = time.time()
@@ -44,8 +43,11 @@ def healthy(b, age):
     b._consecutive_failures["SN"] = 0
 
 
-def msg(sn="SN", retain=False):
-    return SimpleNamespace(topic=f"P/{sn}/refresh", payload=b"1", retain=retain)
+def msg(sn="SN", retain=False, payload=b"1"):
+    return SimpleNamespace(topic=f"P/{sn}/refresh", payload=payload, retain=retain)
+
+
+MARK = b"precycle"
 
 
 # ---- configuration contract ------------------------------------------------
@@ -158,43 +160,43 @@ def test_refresh_message_records_demand_even_during_backoff_but_not_for_unknown_
 
 def test_reuse_when_recent_and_healthy(da):
     healthy(da, 40)
-    assert da._demand_reusable("SN", time.time())
+    assert da._demand_reusable("SN", time.time(), marked=True)
     healthy(da, da.DEMAND_REUSE_MAX_AGE_S - 0.5)
-    assert da._demand_reusable("SN", time.time())
+    assert da._demand_reusable("SN", time.time(), marked=True)
 
 
 def test_no_reuse_when_old_failed_never_polled_or_limited(da):
     healthy(da, da.DEMAND_REUSE_MAX_AGE_S + 2)
-    assert not da._demand_reusable("SN", time.time())
+    assert not da._demand_reusable("SN", time.time(), marked=True)
     healthy(da, 10)
     da._consecutive_failures["SN"] = 1
-    assert not da._demand_reusable("SN", time.time())
+    assert not da._demand_reusable("SN", time.time(), marked=True)
     da._last_successful_poll.pop("SN")
     da._consecutive_failures["SN"] = 0
-    assert not da._demand_reusable("SN", time.time())
+    assert not da._demand_reusable("SN", time.time(), marked=True)
     healthy(da, 10)
     da.rate_limit_backoff = 1
     da._rate_limit_until = time.time() - 1          # recovery unverified
-    assert not da._demand_reusable("SN", time.time())
+    assert not da._demand_reusable("SN", time.time(), marked=True)
 
 
 def test_cycle_skips_request_for_reusable_demand_and_counts_it(da):
     healthy(da, 40)
     da.poll_status = MagicMock(return_value=(True, 200))
-    da.on_mqtt_message(None, None, msg())
+    da.on_mqtt_message(None, None, msg(payload=MARK))
     da._run_poll_cycle()
     da.poll_status.assert_not_called()
-    assert da._demand_stats == {"served": 0, "reused": 1}
+    assert (da._demand_stats["served"], da._demand_stats["reused"]) == (0, 1)
     assert da._demand_requested == set()
 
 
 def test_cycle_serves_demand_when_telemetry_too_old(da):
     healthy(da, da.DEMAND_REUSE_MAX_AGE_S + 20)
     da.poll_status = MagicMock(return_value=(True, 200))
-    da.on_mqtt_message(None, None, msg())
+    da.on_mqtt_message(None, None, msg(payload=MARK))
     da._run_poll_cycle()
     da.poll_status.assert_called_once_with("SN")
-    assert da._demand_stats == {"served": 1, "reused": 0}
+    assert (da._demand_stats["served"], da._demand_stats["reused"]) == (1, 0)
 
 
 def test_confirmation_window_is_never_throttled_by_reuse(da):
@@ -331,14 +333,14 @@ def test_proactive_margin_unchanged_when_off(bridge):
 
 
 def test_diagnostics_publish_effective_state_and_counters(da):
-    da._demand_stats = {"served": 3, "reused": 7}
+    da._demand_stats = {"served": 3, "reused": 7, "marked": 8, "forced": 2}
     da._publish_diagnostics("SN")
     payloads = [c.args[1] for c in da.mqtt_client.publish.call_args_list
                 if c.args and c.args[0] == "P/SN/diagnostics"]
     import json
     body = json.loads(payloads[-1])
     assert body["demand_aware_polling"] is True
-    assert body["demand_refresh"] == {"served": 3, "reused": 7}
+    assert body["demand_refresh"] == {"served": 3, "reused": 7, "marked": 8, "forced": 2}
 
 
 def test_diagnostics_effective_state_is_false_when_ignored(da):
@@ -371,47 +373,104 @@ def test_one_success_per_cycle_has_mean_gap_exactly_300_so_margin_needs_a_phase_
     assert 1 / (max_run + 1) == pytest.approx(1 / 9)
 
 
-# ---- reuse only for Package 19's pre-cycle refreshes (handback freshness wait) --------------
+# ---- reuse only on explicit intent (handback freshness wait) -------------------------------------
 
-GRID = 1794009600.0      # a multiple of 300 s: the :00 of a five-minute cycle
+def _pending(b):
+    return b._demand_requested, b._demand_reuse_ok.get("SN")
 
 
-@pytest.mark.parametrize("offset,expected", [
-    (272.2, True),      # primary :x4:30 + 2.2 s
-    (275.9, True),      # primary tail (measured max latency 3.79 s)
-    (290.2, True),      # conditional retry :x4:48 + 2.2 s
-    (298.0, True),
-    (266.0, True),      # lower edge
-    (265.9, False),
-    (10.0, False),      # translation event +8..11 s: the handback script's refresh
-    (60.0, False), (150.0, False), (0.0, False), (299.5, False),
-])
-def test_phase_gate_reuses_only_pre_cycle_refreshes(da, offset, expected):
-    da.DEMAND_REUSE_PHASE_S = type(da).DEMAND_REUSE_PHASE_S
+@pytest.mark.parametrize("payload", [b"1", b"", b"0", b"PRECYCLE", b"precycle ", b" precycle", b"precycle\n",
+                                     b"pre-cycle", b"reuse", b"true", b"\xff\xfe", None, 1, "1"])
+def test_unknown_or_legacy_payloads_never_gain_reuse(da, payload):
     healthy(da, 40)
-    now = GRID + offset
-    da._last_successful_poll["SN"] = now - 40
-    da._last_demand_at = now
-    assert da._demand_reusable("SN", now, arrived=now) is expected
-
-
-def test_handback_refresh_is_never_satisfied_by_an_old_sample(da):
-    """Package 19's handback script needs a poll stamped >= request - 10 s; a 38 s old sample at
-    the translation event (+10 s) must be refreshed, not reused."""
-    da.DEMAND_REUSE_PHASE_S = type(da).DEMAND_REUSE_PHASE_S
-    now = GRID + 10.0
-    da._last_successful_poll["SN"] = now - 38
-    da._consecutive_failures["SN"] = 0
-    da._last_demand_at = now
-    assert not da._demand_reusable("SN", now, arrived=now)
-
-
-def test_arrival_time_is_recorded_when_queued_not_when_processed(da):
-    da.on_mqtt_message(None, None, msg())
-    assert da._demand_arrived_at["SN"] == da._last_demand_at
+    da.on_mqtt_message(None, None, msg(payload=payload))
+    assert da._demand_requested == {"SN"} and da._demand_reuse_ok["SN"] is False
     da.poll_status = MagicMock(return_value=(True, 200))
     da._run_poll_cycle()
-    assert da._demand_arrived_at == {}
+    da.poll_status.assert_called_once_with("SN")                 # served with a real poll
+    assert da._demand_stats["reused"] == 0 and da._demand_stats["forced"] == 1
+
+
+@pytest.mark.parametrize("payload", [MARK, "precycle"])
+def test_exact_marker_str_or_bytes_is_reusable(da, payload):
+    healthy(da, 40)
+    da.on_mqtt_message(None, None, msg(payload=payload))
+    assert da._demand_reuse_ok["SN"] is True
+    da.poll_status = MagicMock(return_value=(True, 200))
+    da._run_poll_cycle()
+    da.poll_status.assert_not_called()
+    assert da._demand_stats["reused"] == 1 and da._demand_stats["marked"] == 1
+
+
+def test_marked_request_still_needs_a_poll_when_telemetry_is_old_or_unhealthy(da):
+    healthy(da, da.DEMAND_REUSE_MAX_AGE_S + 5)
+    da.poll_status = MagicMock(return_value=(True, 200))
+    da.on_mqtt_message(None, None, msg(payload=MARK))
+    da._run_poll_cycle()
+    da.poll_status.assert_called_once()
+
+
+@pytest.mark.parametrize("first,second,expect_reuse", [
+    (MARK, b"1", False),            # pre-cycle then handback
+    (b"1", MARK, False),            # handback then pre-cycle: the marked one must not upgrade it
+    (MARK, MARK, True),
+    (b"1", b"1", False),
+    (MARK, b"garbage", False),
+    (b"garbage", MARK, False),
+])
+def test_overlapping_requests_forced_intent_wins_in_either_order(da, first, second, expect_reuse):
+    healthy(da, 40)
+    da.on_mqtt_message(None, None, msg(payload=first))
+    da.on_mqtt_message(None, None, msg(payload=second))
+    assert da._demand_reuse_ok["SN"] is expect_reuse
+    da.poll_status = MagicMock(return_value=(True, 200))
+    da._run_poll_cycle()
+    assert (da.poll_status.call_count == 0) is expect_reuse
+    assert da._demand_requested == set() and da._demand_reuse_ok == {}      # consumed together
+
+
+def test_three_way_overlap_and_state_does_not_leak_into_the_next_cycle(da):
+    healthy(da, 40)
+    for pl in (MARK, b"1", MARK):
+        da.on_mqtt_message(None, None, msg(payload=pl))
+    da.poll_status = MagicMock(return_value=(True, 200))
+    da._run_poll_cycle()
+    assert da.poll_status.call_count == 1
+    healthy(da, 40)
+    da.on_mqtt_message(None, None, msg(payload=MARK))               # a fresh marked request is reusable again
+    da._run_poll_cycle()
+    assert da.poll_status.call_count == 1
+
+
+def test_forced_refresh_is_subject_only_to_the_10s_attempt_coalescing(da):
+    healthy(da, 40)
+    da._last_status_attempt["SN"] = time.time() - 4                  # an attempt 4 s ago (any outcome)
+    da.poll_status = MagicMock()
+    da.on_mqtt_message(None, None, msg(payload=b"1"))
+    da._run_poll_cycle()
+    da.poll_status.assert_not_called()                               # existing coalescing, unchanged
+    da._last_status_attempt["SN"] = time.time() - 11
+    da.on_mqtt_message(None, None, msg(payload=b"1"))
+    da.poll_status.return_value = (True, 200)
+    da._run_poll_cycle()
+    da.poll_status.assert_called_once()
+
+
+def test_handback_refresh_is_never_satisfied_by_an_old_sample_at_any_time_of_the_cycle(da):
+    """The adversarial case from review: ownership on, setpoint 50 or the restored baseline, last poll
+    30-80 s old, plain "1" refresh at any moment of the five-minute grid (also the 266-299 s phase)."""
+    da._setpoint_seen["SN"] = 50.0
+    for age in (11, 30, 55, 80):
+        for offset in (0.0, 10.0, 150.0, 266.0, 272.2, 290.2, 298.9):
+            now = time.time()
+            da._last_successful_poll["SN"] = now - age
+            da._consecutive_failures["SN"] = 0
+            assert not da._demand_reusable("SN", now, marked=False), (age, offset)
+
+
+def test_v190_compatible_payload_is_ignored_by_name_not_by_position(da):
+    assert da.DEMAND_PRECYCLE_PAYLOAD == "precycle"
+    assert not hasattr(da, "DEMAND_REUSE_PHASE_S") and not hasattr(da, "_demand_phase_ok")
 
 
 # ---- recovery retry after a failed deadline poll whose quick retry no longer fits --------------
@@ -451,7 +510,7 @@ def test_boost_setpoint_disables_reuse(da, setpoint, reusable):
         da._setpoint_seen.pop("SN", None)
     else:
         da._setpoint_seen["SN"] = setpoint
-    assert da._demand_reusable("SN", time.time()) is reusable
+    assert da._demand_reusable("SN", time.time(), marked=True) is reusable
 
 
 def test_setpoint_is_recorded_from_each_validated_poll_only(da):

@@ -201,14 +201,15 @@ class MyThermowattBridge:
     # requests at :30 (30 s before the cycle) and retries at :48, so the data is at most
     # 80 s + 30 s = 110 s old when the cycle reads it: 10 s inside TELEMETRY_STALE_AFTER.
     DEMAND_REUSE_MAX_AGE_S   = 80
-    # Reuse applies ONLY to Package 19's pre-cycle refreshes, recognised by when they arrive on the
-    # five-minute grid (primary :x4:30 and retry :x4:48, each ~2.2 s late => 272-292 s into the
-    # cycle). Every other refresh (the handback script's, HA-start handback, a manual one) waits
-    # for a poll stamped no more than 10 s before its request and must get a real poll, so it is
-    # always served. (low, high) seconds into the 300 s cycle, measured on the wall-clock epoch
-    # grid; None disables the phase test (reuse for any arrival) and is only meant for tests.
-    DEMAND_REUSE_PHASE_S     = (266.0, 299.0)
-    DEMAND_CYCLE_S           = 300
+    # Reuse is granted ONLY by explicit intent. Package 19's pre-cycle automation publishes the
+    # payload below to P/<serial>/refresh. Anything else -- the handback script's and the HA-start
+    # recovery's plain "1", a manual publish, any unknown or undecodable payload -- is a forced
+    # refresh: it needs a real poll (subject only to the 10 s DEMAND_MIN_SPACING attempt coalescing),
+    # because the handback script waits for a poll stamped >= its request - 10 s. When requests for
+    # one device overlap before the poll loop runs, the forced intent always wins, in either order.
+    # Arrival time proves nothing about origin and is never used. A v1.9.0 bridge ignores the
+    # payload entirely, so publishing the marker to an old bridge is a plain refresh.
+    DEMAND_PRECYCLE_PAYLOAD  = "precycle"
     # While the heater's observed setpoint is at or above this (Package 19's TEMP 70 boost; the native
     # baseline is far lower), a requested refresh is always served: an owned boost gets fresh data at
     # every cycle (age <= ~30 s as today). Costs ~2-5 requests/day on measured boost profiles. A
@@ -271,8 +272,8 @@ class MyThermowattBridge:
         # HTTP call or command queue is created on the MQTT callback thread.
         self._demand_requested = set()  # guarded by _config_lock
         self._last_demand_at = None     # wall time of the last accepted-serial refresh request
-        self._demand_stats = {"served": 0, "reused": 0}   # in-memory commissioning evidence
-        self._demand_arrived_at = {}    # serial -> wall time the pending refresh request arrived
+        self._demand_stats = {"served": 0, "reused": 0, "marked": 0, "forced": 0}   # in-memory commissioning evidence
+        self._demand_reuse_ok = {}      # serial -> True only while every pending request is a marked pre-cycle one
         self._recovery_retry_ts = {}    # serial -> last_success stamp the recovery retry was spent on
         self._setpoint_seen = {}        # serial -> T_SetPoint of the last validated status
         self._last_status_attempt = {}
@@ -959,16 +960,15 @@ class MyThermowattBridge:
         now = time.time() if now is None else now
         return 0 <= now - last <= self.DEMAND_ACTIVE_WINDOW_S
 
-    def _demand_phase_ok(self, arrived) -> bool:
-        """True when the refresh arrived in the pre-cycle part of the five-minute grid."""
-        window = self.DEMAND_REUSE_PHASE_S
-        if window is None:
-            return True
-        if arrived is None:
+    def _is_precycle_payload(self, payload) -> bool:
+        """Exactly the marker string; anything else (including None / undecodable) is not."""
+        try:
+            text = payload.decode("utf-8") if isinstance(payload, (bytes, bytearray)) else payload
+        except Exception:  # noqa: BLE001
             return False
-        return window[0] <= (arrived % self.DEMAND_CYCLE_S) < window[1]
+        return isinstance(text, str) and text == self.DEMAND_PRECYCLE_PAYLOAD
 
-    def _demand_reusable(self, serial: str, now: float, arrived=None) -> bool:
+    def _demand_reusable(self, serial: str, now: float, marked: bool = False) -> bool:
         """A requested refresh needs no request when healthy telemetry is recent enough.
 
         Healthy = a validated poll, no consecutive failures, no quota window or unverified
@@ -976,8 +976,8 @@ class MyThermowattBridge:
         check there) or when the last poll failed."""
         if not self._demand_active(now):
             return False
-        if not self._demand_phase_ok(now if arrived is None else arrived):
-            return False
+        if not marked:
+            return False                      # forced refresh: never reuse
         setpoint = self._setpoint_seen.get(serial)
         if isinstance(setpoint, (int, float)) and setpoint >= self.DEMAND_BOOST_SETPOINT_C:
             return False
@@ -2139,9 +2139,13 @@ class MyThermowattBridge:
                 self._last_demand_at = time.time()  # HA is alive and asking (even while backing off)
                 if self._rate_limit_snapshot()["step"] > 0:
                     return
+                marked = self._is_precycle_payload(getattr(msg, "payload", None))
                 with self._config_lock:
+                    pending = serial in self._demand_requested
+                    # forced intent wins whatever the order; a marked request never upgrades a forced one
+                    self._demand_reuse_ok[serial] = marked and (self._demand_reuse_ok.get(serial, False) if pending else True)
                     self._demand_requested.add(serial)
-                    self._demand_arrived_at[serial] = self._last_demand_at
+                self._demand_stats["marked" if marked else "forced"] += 1
                 self._poll_wakeup.set()
                 return
 
@@ -2288,8 +2292,8 @@ class MyThermowattBridge:
             device_serials = list(self.config.get('devices', {}).keys())
             requested = set(self._demand_requested)
             self._demand_requested.clear()
-            arrived_at = dict(self._demand_arrived_at)
-            self._demand_arrived_at.clear()
+            reuse_ok = dict(self._demand_reuse_ok)
+            self._demand_reuse_ok.clear()
 
         for serial in device_serials:
             if self._rate_limit_remaining() > 0:
@@ -2305,7 +2309,7 @@ class MyThermowattBridge:
                         print(f"[POLL] Refresh for {serial} coalesced: recent attempt "
                               f"{'gave' if fresh else 'gave no'} fresh telemetry")
                         continue
-                    if self._demand_reusable(serial, now, arrived_at.get(serial, now)):
+                    if self._demand_reusable(serial, now, reuse_ok.get(serial, False)):
                         self._demand_stats["reused"] += 1
                         print(f"[POLL] Refresh for {serial} reused: healthy telemetry "
                               f"{now - self._last_successful_poll[serial]:.0f}s old, no request")

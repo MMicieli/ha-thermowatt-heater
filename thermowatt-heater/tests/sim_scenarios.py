@@ -69,12 +69,10 @@ PROFILES = {
 }
 
 
-def run(name, mode, seed=1, recovery_retry=None, fail_profile=None, phase_gate=True, boost_rule=True, **world_kw):
-    w = World(seed=seed, **MODES[mode], **world_kw)
+def run(name, mode, seed=1, recovery_retry=None, fail_profile=None, precycle_marker=True, boost_rule=True, **world_kw):
+    w = World(seed=seed, **MODES[mode], precycle_marker=precycle_marker, **world_kw)
     tmp = pathlib.Path(tempfile.mkdtemp())
     w.build(tmp)
-    if not phase_gate:
-        w.b.DEMAND_REUSE_PHASE_S = None
     if not boost_rule:
         w.b.DEMAND_BOOST_SETPOINT_C = 1e9
     if recovery_retry is not None:
@@ -140,6 +138,122 @@ def run(name, mode, seed=1, recovery_retry=None, fail_profile=None, phase_gate=T
     }
     w.close()
     return res
+
+
+def adversarial_handback(mode, phases=(262, 268, 272, 280, 290, 296, 299, 5, 10, 60, 150), seed=4, setpoint=58.0,
+                         precycle_marker=True, arrival_inference=False, trials_per_phase=8, extra=None):
+    """Ownership ON, native setpoint below the boost rule (58, or 50 after a soft stop), a handback / HA-start
+    refresh (plain "1") arriving at assorted phases of the five-minute grid. Returns [(phase, age_s, outcome)].
+    arrival_inference=True emulates the superseded PR #25 head (reuse for anything arriving 266-299 s in)."""
+    import tempfile
+    from tests.sim_harness import SN
+    w = World(seed=seed, days=1, **MODES[mode], precycle_marker=precycle_marker)
+    w.p19 = True
+    w.build(pathlib.Path(tempfile.mkdtemp()))
+    if arrival_inference:
+        b = w.b
+
+        def inferred(payload, _b=b):
+            return 266 <= (w.clk.now - T0) % 300 < 299
+        b._is_precycle_payload = inferred
+    if extra:
+        extra(w)
+    trials = []
+
+    def trial(ph):
+        def fire():
+            ts = w.b._last_successful_poll.get(SN)
+            w.ownership, w.baseline = True, setpoint
+            w.last_status = dict(w.last_status or {}, T_SetPoint=setpoint)
+            n0 = len(w.handbacks)
+            w.start_handback()
+            trials.append((ph, (w.clk.now - ts) if ts else None, n0))
+        return fire
+    for k in range(40, 40 + len(phases) * trials_per_phase):
+        ph = phases[k % len(phases)]
+        w.at(T0 + 300 * k + ph, trial(ph))
+    try:
+        w.run()
+    finally:
+        w.close()
+    out = []
+    for ph, age, n0 in trials:
+        hb = w.handbacks[n0] if n0 < len(w.handbacks) else None
+        out.append((ph, age, hb["outcome"] if hb else None))
+    return out
+
+
+def outstanding_handback(kind, mode, seed=2, precycle_marker=True):
+    """One owned boost (cycle 100), then an obstacle in front of the handback. kind:
+    soft_stop_fail (TEMP 50 accepted but never applied for 3 h) | stale (cloud unreachable 14 min) |
+    quota (vendor quota window 90 min). Returns outcomes, requests per attempt and the end state."""
+    import tempfile
+    w = World(seed=seed, days=1, **MODES[mode], precycle_marker=precycle_marker)
+    w.p19 = True
+    w.build(pathlib.Path(tempfile.mkdtemp()))
+    w.wants.add(100)
+    t1 = T0 + 300 * 101
+    if kind == "soft_stop_fail":
+        w.cloud.ignore_setpoints.append((t1, t1 + 3 * 3600, {50.0}))
+        window = (t1, t1 + 3 * 3600)
+    elif kind == "stale":
+        w.cloud.outages.append((t1 - 30, t1 + 14 * 60))
+        window = (t1 - 30, t1 + 14 * 60)
+    elif kind == "quota":
+        w.cloud.quota_windows.append((t1 - 120, t1 + 90 * 60))
+        window = (t1 - 120, t1 + 90 * 60)
+    else:
+        raise ValueError(kind)
+    snap = {}
+    mid = window[0] + (window[1] - window[0]) / 3
+    w.at(mid, lambda: snap.update(owned_in_window=w.ownership, setpoint_in_window=w.cloud.heater["T_SetPoint"],
+                                  cmds=len(w.commands)))
+    w.at(window[1] - 1, lambda: snap.update(cmds_end=len(w.commands)))
+    sent0 = {}
+    w.at(t1 - 1, lambda: sent0.update(n=sum(v for (d, c), v in w.cloud.sent.items())))
+    try:
+        w.run()
+    finally:
+        w.close()
+    attempts_in_window = [h for h in w.handbacks if window[0] - 400 <= h["t"] <= window[1]]
+    total = sum(v for (d, c), v in w.cloud.sent.items())
+    return {"outcomes": [h["outcome"] for h in w.handbacks], "attempts_in_window": len(attempts_in_window),
+            "owned_in_window": snap.get("owned_in_window"), "setpoint_in_window": snap.get("setpoint_in_window"),
+            "owned_end": w.ownership, "setpoint_end": w.cloud.heater["T_SetPoint"],
+            "commands_during_window": snap.get("cmds_end", 0) - snap.get("cmds", 0), "rejected": dict(w.cloud.rejected),
+            "cmd_refused": len(re.findall(r"command NOT sent", w._out.getvalue())),
+            "last_outcome": w.handbacks[-1]["outcome"] if w.handbacks else None,
+            "resolved_after_s": (w.handbacks[-1].get("end", 0) - w.handbacks[0]["t"]) if w.handbacks else None,
+            "requests_per_failed_attempt": (st.mean(h["sent_end"] - h["sent"] for h in w.handbacks if h["outcome"] not in ("ok", None))
+                                            if any(h["outcome"] not in ("ok", None) for h in w.handbacks) else None)}
+
+
+def capped_active_day(mode, shift_h=16.5, cap=468, profile="day10", precycle_marker=True):
+    """The real 10 Nov boost profile shifted later in the UTC day against a hypothetical first-rejection
+    count (cap accepted requests per UTC day, then quota rejection until midnight)."""
+    import tempfile
+    w = World(seed=2, days=2, **MODES[mode], precycle_marker=precycle_marker)
+    w.p19 = True
+    w.build(pathlib.Path(tempfile.mkdtemp()))
+    w.cloud.cap = cap
+    for start_min, dur in PROFILES[profile]:
+        for i in range(dur // 5):
+            w.wants.add(int((start_min + shift_h * 60) // 5) + i)
+    snap = {}
+    w.at(T0 + DAY - 2, lambda: snap.update(owned=w.ownership, setpoint=w.cloud.heater["T_SetPoint"]))
+    try:
+        w.run()
+    finally:
+        w.close()
+    fr = w.cloud.first_reject_t
+    resolved = next((g["t"] for g in w.gate_log if fr and g["t"] > fr and not g["ownership"]), None)
+    return {"first_rejection_h": None if fr is None else round((fr - T0) / 3600, 2),
+            "rejected": dict(w.cloud.rejected), "per_day": w.per_day(),
+            "owned_at_midnight": snap.get("owned"), "setpoint_at_midnight": snap.get("setpoint"),
+            "ownership_outstanding_h": None if not fr or resolved is None else round((resolved - fr) / 3600, 2),
+            "commands_refused": len(re.findall(r"command NOT sent", w._out.getvalue())),
+            "handback_outcomes": collections.Counter(h["outcome"] for h in w.handbacks) if (collections := __import__("collections")) else None,
+            "owned_end": w.ownership}
 
 
 def deadline_fault(mode, kind, severity=0.0, seed=3, recovery=None, which="deadline"):
