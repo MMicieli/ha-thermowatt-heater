@@ -1,6 +1,6 @@
 """Assertions for the stubbed container e2e (run_e2e.sh). Exits non-zero on any violation.
 
-Usage: verify_e2e.py <A|B|C|D|F|G|H> <out-dir>
+Usage: verify_e2e.py <A|B|C|D|F|G|H|S|S0> <out-dir>
 
 A and B (rate-limit windows, opaque tokens) are unchanged. C, D, F and G use synthetic JWT access
 tokens with short controlled expiry (see stub_api.py JWT_LIFETIME) to exercise the proactive
@@ -481,6 +481,144 @@ def check_scenario_g(api, bridge_log, mqtt, supervisor, meta):
     return f
 
 
+# --------------------------------------------------------------------------------------------- #
+# Stage 3 (issue #17, PR #25): demand-aware polling, scenarios S (option on) and S0 (option absent)
+# --------------------------------------------------------------------------------------------- #
+SLOW_DELAY = 16.0   # stub_api.py SLOW_DELAY: a slow /status is logged on completion; arrival = abs - delay
+
+
+def parse_api_ts(text):
+    """`docker logs --timestamps` of the stub API -> api entries with an absolute time `abs` (epoch s)."""
+    import datetime as dt
+    import re
+    out = []
+    for line in text.splitlines():
+        head, _, rest = line.partition(" ")
+        rest = rest.strip()
+        if not rest.startswith("{"):
+            continue
+        try:
+            e = json.loads(rest)
+            ts = re.sub(r"(\.\d{6})\d*Z$", r"\1+00:00", head)
+            e["abs"] = dt.datetime.fromisoformat(ts).timestamp() - (SLOW_DELAY if e.get("slow") else 0.0)
+        except ValueError:
+            continue
+        out.append(e)
+    return out
+
+
+def parse_events(text):
+    out = {}
+    for line in text.splitlines():
+        a, _, b = line.partition(" ")
+        try:
+            out[b.strip()] = float(a)
+        except ValueError:
+            pass
+    return out
+
+
+def _status_between(api, lo, hi, include_slow=True):
+    return [e for e in api if e["p"] == "/status" and lo <= e["abs"] < hi and (include_slow or not e.get("slow"))]
+
+
+def check_scenario_s(api, events, bridge_log, mqtt, supervisor, meta, option_on=True):
+    """Stage 3 container scenario. api entries carry `abs` (see parse_api_ts); events are harness epochs.
+    Pure: unit-tested with synthetic data in tests/test_e2e_verifier.py."""
+    f = check_common(api, bridge_log, mqtt, supervisor, meta)
+    need = ("start", "reuse_precycle", "forced_1", "overlap_precycle_then_1", "overlap_1_then_precycle",
+            "slow_start", "slow_forced", "slow_end", "recovered_check", "quiet_start", "quiet_end",
+            "quota_start", "quota_limited", "quota_pub2", "limit_off", "end")
+    missing = [n for n in need if n not in events]
+    if missing:
+        return f + [f"timeline incomplete, missing events: {missing}"]
+    tag = "S" if option_on else "S0"
+    if meta.get("exit_code") not in (0, None):
+        f.append(f"{tag}: bridge exit code {meta.get('exit_code')}")
+    for path in ("/refresh",) + tuple(COMMAND_PATHS):
+        if [e for e in api if e["p"] == path] and path != "/refresh":
+            f.append(f"{tag}: unexpected {path} request (demand refresh is read-only status polling)")
+    # 1. startup: login, user-info, status in order; the retained "1" published before start added no extra poll
+    first = [e["p"] for e in api][:3]
+    if first != ["/login", "/user-info", "/status"]:
+        f.append(f"{tag}: startup request order {first}")
+    t0 = api[0]["abs"] if api else 0
+    early = _status_between(api, t0, t0 + 30)
+    if len(early) != 1:
+        f.append(f"{tag}: expected exactly 1 /status in the first 30 s (retained refresh must not poll), saw {len(early)}")
+    # 2. marked pre-cycle refresh: S reuses a 40 s old poll (no request); S0 polls
+    t = events["reuse_precycle"]
+    n = len(_status_between(api, t, t + 15))
+    if option_on and n != 0:
+        f.append(f"S: marked precycle refresh at a 40 s old poll caused {n} /status request(s); expected reuse")
+    if not option_on and n < 1:
+        f.append("S0: option off must poll for every refresh (legacy behaviour)")
+    # 3. forced plain "1": always a real poll within a few seconds
+    t = events["forced_1"]
+    if len(_status_between(api, t, t + 12)) < 1:
+        f.append(f"{tag}: plain '1' refresh did not produce a real /status poll within 12 s")
+    # 4. overlapping marked and forced requests, both orders: forced wins (>=1 poll) and coalescing keeps it <= 2
+    for label in ("overlap_precycle_then_1", "overlap_1_then_precycle"):
+        t = events[label]
+        n = len(_status_between(api, t, t + 15))
+        if n < 1:
+            f.append(f"{tag}: {label}: no /status poll (forced intent lost)")
+        if n > 2:
+            f.append(f"{tag}: {label}: {n} polls for two messages (10 s coalescing broken)")
+    # 5. read-timeout recovery: bounded attempts while slow, a good poll afterwards, back to healthy diagnostics
+    lo, hi = events["slow_start"], events["slow_end"]
+    slow = [e for e in api if e["p"] == "/status" and e.get("slow")]
+    during = [e for e in slow if lo <= e["abs"] <= hi]
+    if not during:
+        f.append(f"{tag}: no request hit the slow window: fault injection ineffective")
+    if len(during) > (hi - lo) / 15.0 + 3:
+        f.append(f"{tag}: {len(during)} requests in a {hi - lo:.0f} s read-timeout window (request storm)")
+    good = [e for e in _status_between(api, hi, events["recovered_check"], include_slow=False)]
+    if not good:
+        f.append(f"{tag}: no successful /status within the recovery period after the slow window")
+    if len([e for e in api if e["p"] == "/login"]) > 1:
+        f.append(f"{tag}: re-login during timeouts (timeouts must not look like auth failures)")
+    diags = [(None, d) for d in diagnostics(mqtt)]
+    after_diags = [d for _, d in diags]
+    # 6. missing HA refreshes: no gap above 300 s (never offline from lack of refreshes); S reverts to the 180 s cadence
+    qs, qe = events["quiet_start"], events["quiet_end"]
+    q = sorted(e["abs"] for e in _status_between(api, qs, qe, include_slow=False))
+    gaps = [b - a for a, b in zip(q, q[1:])]
+    if len(q) < 4:
+        f.append(f"{tag}: only {len(q)} polls in the quiet period")
+    if gaps and max(gaps) > 300 + TOL:
+        f.append(f"{tag}: {max(gaps):.0f} s gap between polls while HA sent no refreshes (offline threshold 300 s)")
+    if len(gaps) >= 2 and not all(180 - 2 * TOL <= g <= 180 + 2 * TOL for g in gaps[-2:]):
+        f.append(f"{tag}: last quiet-period gaps {[round(g) for g in gaps[-2:]]}, expected the legacy 180 s cadence")
+    # 7. quota backoff: nothing sent during the 120 s window, refresh messages included; first request after is /status
+    lim = [e for e in api if e.get("limited")]
+    if not lim:
+        f.append(f"{tag}: quota window never reached the bridge")
+    else:
+        t_lim = lim[0]["abs"]
+        window = [e for e in api if t_lim + 0.5 < e["abs"] < t_lim + BASE - TOL]
+        if window:
+            f.append(f"{tag}: API requests during quota backoff: {[(e['p'], round(e['abs'] - t_lim, 1)) for e in window]}")
+        after = [e for e in api if e["abs"] >= t_lim + BASE - TOL][:1]
+        if not after or after[0]["p"] != "/status":
+            f.append(f"{tag}: first request after backoff must be the /status probe: {[e['p'] for e in after]}")
+    last_rl = next((d.get("rate_limit", {}).get("state") for d in reversed(after_diags) if d.get("rate_limit")), None)
+    if last_rl != "recovered":
+        f.append(f"{tag}: final rate_limit state {last_rl!r}, expected 'recovered' after a real post-limit poll")
+    last = after_diags[-1] if after_diags else {}
+    if last.get("poll_status") != "ok" or last.get("consecutive_failures") != 0:
+        f.append(f"{tag}: final poll_status/failures {last.get('poll_status')!r}/{last.get('consecutive_failures')!r}")
+    # 8. option reporting
+    flag = last.get("demand_aware_polling")
+    if flag is not option_on:
+        f.append(f"{tag}: diagnostics demand_aware_polling={flag!r}, expected {option_on}")
+    if option_on:
+        stats = last.get("demand_refresh") or {}
+        if not (stats.get("marked", 0) >= 3 and stats.get("forced", 0) >= 3):
+            f.append(f"S: demand_refresh counters {stats}: expected >=3 marked and >=3 forced requests")
+    return f
+
+
 def main(argv):
     scenario, out = argv[1].upper(), pathlib.Path(argv[2])
     read = lambda n: (out / n).read_text(encoding="utf-8", errors="replace") if (out / n).exists() else ""  # noqa: E731
@@ -488,6 +626,17 @@ def main(argv):
     supervisor = parse_json_lines(read("supervisor.log"))
     mqtt = parse_mqtt(read("mqtt.log"))
     meta = json.loads(read("meta.json") or "{}")
+    if scenario in ("S", "S0"):
+        ts_api = parse_api_ts(read("api.ts.log"))
+        failures = check_scenario_s(ts_api, parse_events(read("events.log")), read("bridge.log"), mqtt, supervisor,
+                                    meta, option_on=(scenario == "S"))
+        if failures:
+            print(f"E2E {scenario}: FAIL ({len(failures)})")
+            for item in failures:
+                print(" -", item)
+            return 1
+        print(f"E2E {scenario}: PASS (api requests={len(ts_api)}, diagnostics={len(diagnostics(mqtt))})")
+        return 0
     jwt_checks = {"H": check_scenario_h, "C": check_scenario_c, "D": check_scenario_d, "F": check_scenario_f, "G": check_scenario_g}
     if scenario in jwt_checks:
         log = read("bridge.log") + "\n--- SECOND START ---\n" + read("bridge2.log")

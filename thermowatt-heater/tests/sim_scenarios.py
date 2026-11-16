@@ -107,8 +107,8 @@ def run(name, mode, seed=1, recovery_retry=None, fail_profile=None, precycle_mar
     elif name == "nodemand":                  # Package 19 pre-cycle automation disabled 6 h
         w.ha_automation_off.append((hms(0, 8), hms(0, 14)))
         excl = [(hms(0, 8), hms(0, 14, 5))]
-    elif name in ("p128", "p015"):            # all-day repeated transport failure, per request
-        w.cloud.p_fail = 0.128 if name == "p128" else 0.015
+    elif name in ("p128", "p015", "p006"):    # all-day repeated transport failure, per request
+        w.cloud.p_fail = {"p128": 0.128, "p015": 0.015, "p006": 0.006}[name]   # p006: 95 % bound on 0 failures in ~490
     elif name.startswith("jitter"):           # sensitivity: HA/MQTT latency jitter sd in seconds (jitterN)
         pass
     elif name == "failed_refresh":

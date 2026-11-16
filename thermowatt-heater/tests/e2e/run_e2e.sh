@@ -1,8 +1,12 @@
 #!/bin/bash
 # Stubbed container e2e of the REAL add-on entrypoint (Dockerfile ENTRYPOINT /init + CMD /run.sh, bashio).
-# ~10 minutes each. usage: run_e2e.sh <name> <A|B|C|D|F|G|H>   (run from this directory)
+# ~10 minutes each (S/S0: ~35 minutes). usage: run_e2e.sh <name> <A|B|C|D|F|G|H|S|S0>   (run from this directory)
 #   image: ./build_image.sh HEAD thermowatt-pr16:test   (override with IMAGE=...; do NOT docker build from a CRLF working tree)
 #   A: HTTP-200 'Daily request limit exceeded' window, commands refused in-window, recovery, Eco accepted
+#   S/S0: Stage 3 (issue #17 PR #25): poll_interval=180 with demand_aware_polling=true (S) or the option absent (S0),
+#      event-driven timeline: marked pre-cycle reuse, forced handback refresh, overlapping requests in both
+#      orders, read-timeout recovery, a quiet period (missing HA refreshes), quota backoff. Faults are injected
+#      by touching /tmp/slow and /tmp/limit in the stub API container. No vendor API, no heater, no HA.
 #   B: HTTP 429 window; container stopped (SIGTERM) and restarted inside the window (persisted backoff)
 # Simulated Supervisor (options + MQTT service discovery), authenticated Mosquitto, TLS verification ON via a
 # throwaway CA (REQUESTS_CA_BUNDLE). Exit status is that of verify_e2e.py (non-zero on any violation).
@@ -42,7 +46,8 @@ case "$SCEN" in
   F)   LF=-1; LU=-1; ST=200; JWT_ENV="-e JWT_LIFETIME=300 -e REFRESH_FAIL_FIRST=1" ;;
   G)   LF=30; LU=100; ST=200; JWT_ENV="-e JWT_LIFETIME=150" ;;
   H)   LF=300; LU=400; ST=200 ;;
-  *) echo "unknown scenario $SCEN (A|B|C|D|F|G|H)"; exit 2 ;;
+  S|S0) LF=-1; LU=-1; ST=200 ;;
+  *) echo "unknown scenario $SCEN (A|B|C|D|F|G|H|S|S0)"; exit 2 ;;
 esac
 docker run -d --name $NET-api --network $NET --network-alias myapp-connectivity.com -e LIMIT_FROM=$LF -e LIMIT_UNTIL=$LU -e LIMIT_STYLE=$ST $JWT_ENV \
   -v "$D/stub_api.py:/stub_api.py:ro" -v "$D/ca.pem:/certs/ca.pem:ro" -v "$D/key.pem:/certs/key.pem:ro" python:3.12-alpine python -u /stub_api.py >/dev/null
@@ -51,6 +56,8 @@ docker run -d --name $NET-api --network $NET --network-alias myapp-connectivity.
 OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000}'
 # C, F, G enable the new option; A, B and D keep the original options (no proactive_token_refresh key).
 case "$SCEN" in H) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"poll_interval":300}' ;; esac
+case "$SCEN" in S) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"poll_interval":180,"demand_aware_polling":true}' ;; esac
+case "$SCEN" in S0) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"poll_interval":180}' ;; esac
 case "$SCEN" in C|F|G) OPTS='{"email":"stub@example.test","password":"stubpass-SECRET","element_wattage":3000,"proactive_token_refresh":true}' ;; esac
 MQ="{\"host\":\"mqtt\",\"port\":1883,\"username\":\"tw-user\",\"password\":\"$MQPASS\",\"ssl\":false,\"protocol\":\"3.1.1\"}"
 docker run -d --name $NET-sup --network $NET --network-alias supervisor -e SUPERVISOR_TOKEN=$TOKEN -e ADDON_OPTIONS_JSON="$OPTS" -e MQTT_SERVICE_JSON="$MQ" \
@@ -63,14 +70,53 @@ sleep 1
 run_bridge() { docker run -d --name $1 --network $NET -e SUPERVISOR_TOKEN=$TOKEN -e REQUESTS_CA_BUNDLE=/ca.pem \
   -v "$D/ca.pem:/ca.pem:ro" -v $NET-data:/data "$IMAGE" >/dev/null; }
 # H: a RETAINED refresh request exists before the bridge starts; it must not cause a poll.
-[ "$SCEN" = H ] && docker exec $NET-mqtt mosquitto_pub -r -u tw-user -P $MQPASS -t P/STUBSN1/refresh -m 1
+{ [ "$SCEN" = H ] || [ "$SCEN" = S ] || [ "$SCEN" = S0 ]; } && docker exec $NET-mqtt mosquitto_pub -r -u tw-user -P $MQPASS -t P/STUBSN1/refresh -m 1
 run_bridge $NET-bridge
 START=$(date +%s)
 at() { local target=$1; local now=$(( $(date +%s) - START )); [ $target -gt $now ] && sleep $(( target - now )); }
 pub() { docker exec $NET-mqtt mosquitto_pub -u tw-user -P $MQPASS -t "$1" -m "$2"; }
 exit_code() { docker inspect "$1" --format '{{.State.ExitCode}}'; }
 META="$OUT/meta.json"
-if [ "$SCEN" = A ]; then
+# --- Stage 3 helpers: all timing is read back from the stub API's own log, never guessed ---
+ev() { echo "$(date +%s.%N) $1" >> "$OUT/events.log"; }
+st_info() {  # "<count of /status requests> <seconds since the last one>"
+  docker logs --timestamps $NET-api 2>&1 | $PY -c "
+import sys, re, datetime as d
+n = 0; last = None
+for l in sys.stdin:
+    if '\"/status\"' in l and '\"slow\"' not in l:
+        n += 1; last = l.split(' ', 1)[0]
+age = 9999.0
+if last:
+    last = re.sub(r'(\.\d{6})\d*Z', r'\1+00:00', last)
+    age = (d.datetime.now(d.timezone.utc) - d.datetime.fromisoformat(last)).total_seconds()
+print(n, int(age))"
+}
+wait_status_count() { local i=0; until [ "$(st_info | cut -d' ' -f1)" -ge "$1" ]; do sleep 2; i=$((i+1)); [ $i -gt 900 ] && { echo "timeout waiting for status count $1"; break; }; done; }
+wait_age() { local i=0; until [ "$(st_info | cut -d' ' -f2)" -ge "$1" ]; do sleep 1; i=$((i+1)); [ $i -gt 900 ] && { echo "timeout waiting for age $1"; break; }; done; }
+pub2() { docker exec $NET-mqtt sh -c "mosquitto_pub -u tw-user -P $MQPASS -t P/STUBSN1/refresh -m $1; mosquitto_pub -u tw-user -P $MQPASS -t P/STUBSN1/refresh -m $2"; }
+if [ "$SCEN" = S ] || [ "$SCEN" = S0 ]; then
+  : > "$OUT/events.log"
+  ev start
+  wait_status_count 2                                   # boot poll + first timed poll (legacy cadence, no refresh seen yet)
+  wait_age 40;  ev reuse_precycle;  pub P/STUBSN1/refresh precycle     # marked, last poll 40 s old: S reuses, S0 polls
+  wait_age 150; ev forced_1;        pub P/STUBSN1/refresh 1            # handback-style plain "1": always a real poll
+  wait_age 60;  ev overlap_precycle_then_1; pub2 precycle 1
+  wait_age 70;  ev overlap_1_then_precycle; pub2 1 precycle
+  docker exec $NET-api touch /tmp/slow; ev slow_start    # /status answered after 16 s > 15 s read timeout
+  wait_age 30;  ev slow_forced;     pub P/STUBSN1/refresh 1
+  sleep 75;     docker exec $NET-api rm -f /tmp/slow; ev slow_end
+  sleep 90;     ev recovered_check
+  ev quiet_start; sleep 1050; ev quiet_end              # HA publishes no refreshes at all
+  docker exec $NET-api touch /tmp/limit; ev quota_start
+  i=0; until docker logs $NET-api 2>&1 | grep -q '"limited": true'; do sleep 2; i=$((i+1)); [ $i -gt 200 ] && break; done
+  ev quota_limited; pub P/STUBSN1/refresh 1
+  sleep 20;     ev quota_pub2;      pub P/STUBSN1/refresh precycle
+  sleep 30;     docker exec $NET-api rm -f /tmp/limit; ev limit_off
+  sleep 200;    ev end
+  docker stop -t 20 $NET-bridge >/dev/null
+  echo "{\"exit_code\": $(exit_code $NET-bridge)}" > "$META"
+elif [ "$SCEN" = A ]; then
   at 150; pub P/STUBSN1/CMD/MODE Off
   at 300; pub P/STUBSN1/CMD/TEMP 50
   at 520; pub P/STUBSN1/CMD/MODE Eco
@@ -115,6 +161,7 @@ else
   echo "{\"first_exit_code\": $FIRST_EXIT, \"second_exit_code\": $(exit_code $NET-bridge2), \"second_status\": \"$S2\", \"second_restart_count\": $R2, \"persisted_rate_limit\": $PERSISTED}" > "$META"
 fi
 docker logs $NET-api > "$OUT/api.log" 2>&1
+docker logs --timestamps $NET-api > "$OUT/api.ts.log" 2>&1
 docker logs $NET-sup > "$OUT/supervisor.log" 2>&1
 docker logs $NET-bridge > "$OUT/bridge.log" 2>&1
 case "$SCEN" in B|C|G) docker logs $NET-bridge2 > "$OUT/bridge2.log" 2>&1 ;; esac
