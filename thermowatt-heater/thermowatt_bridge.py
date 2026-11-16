@@ -201,12 +201,29 @@ class MyThermowattBridge:
     # requests at :30 (30 s before the cycle) and retries at :48, so the data is at most
     # 80 s + 30 s = 110 s old when the cycle reads it: 10 s inside TELEMETRY_STALE_AFTER.
     DEMAND_REUSE_MAX_AGE_S   = 80
+    # Reuse applies ONLY to Package 19's pre-cycle refreshes, recognised by when they arrive on the
+    # five-minute grid (primary :x4:30 and retry :x4:48, each ~2.2 s late => 272-292 s into the
+    # cycle). Every other refresh (the handback script's, HA-start handback, a manual one) waits
+    # for a poll stamped no more than 10 s before its request and must get a real poll, so it is
+    # always served. (low, high) seconds into the 300 s cycle, measured on the wall-clock epoch
+    # grid; None disables the phase test (reuse for any arrival) and is only meant for tests.
+    DEMAND_REUSE_PHASE_S     = (266.0, 299.0)
+    DEMAND_CYCLE_S           = 300
+    # While the heater's observed setpoint is at or above this (Package 19's TEMP 70 boost; the native
+    # baseline is far lower), a requested refresh is always served: an owned boost gets fresh data at
+    # every cycle (age <= ~30 s as today). Costs ~2-5 requests/day on measured boost profiles. A
+    # baseline set above this simply keeps legacy cadence (the safe direction).
+    DEMAND_BOOST_SETPOINT_C  = 65.0
     # Demand-aware behaviour applies only while refresh requests keep arriving (two missed
     # five-minute cycles plus a minute); otherwise the legacy fixed interval applies.
     DEMAND_ACTIVE_WINDOW_S   = 660
     # Deadline poll is due this long before OFFLINE_AFTER_S: covers scheduling jitter, round
     # trip and one DEMAND_RETRY_DELAY retry of a transport failure inside the 300 s bound.
     OFFLINE_SAFETY_MARGIN_S  = 10
+    # A failed deadline poll whose 5 s retry no longer fits inside the 300 s bound (connect or
+    # read timeout: HTTP_TIMEOUT=(5, 15)) is retried once after this delay instead of after the
+    # legacy 180 s; a second failure falls back to the legacy interval. 0 disables.
+    DEMAND_RECOVERY_RETRY_S  = 20
 
     # CMD_COOLDOWN per command type — MODE and TEMP each have their own 15s window so a
     # valid paired sequence (MODE then TEMP, or vice versa) is never incorrectly blocked.
@@ -255,6 +272,9 @@ class MyThermowattBridge:
         self._demand_requested = set()  # guarded by _config_lock
         self._last_demand_at = None     # wall time of the last accepted-serial refresh request
         self._demand_stats = {"served": 0, "reused": 0}   # in-memory commissioning evidence
+        self._demand_arrived_at = {}    # serial -> wall time the pending refresh request arrived
+        self._recovery_retry_ts = {}    # serial -> last_success stamp the recovery retry was spent on
+        self._setpoint_seen = {}        # serial -> T_SetPoint of the last validated status
         self._last_status_attempt = {}
 
         # Per-device command cooldown and confirmation state, keyed by command type.
@@ -939,13 +959,27 @@ class MyThermowattBridge:
         now = time.time() if now is None else now
         return 0 <= now - last <= self.DEMAND_ACTIVE_WINDOW_S
 
-    def _demand_reusable(self, serial: str, now: float) -> bool:
+    def _demand_phase_ok(self, arrived) -> bool:
+        """True when the refresh arrived in the pre-cycle part of the five-minute grid."""
+        window = self.DEMAND_REUSE_PHASE_S
+        if window is None:
+            return True
+        if arrived is None:
+            return False
+        return window[0] <= (arrived % self.DEMAND_CYCLE_S) < window[1]
+
+    def _demand_reusable(self, serial: str, now: float, arrived=None) -> bool:
         """A requested refresh needs no request when healthy telemetry is recent enough.
 
         Healthy = a validated poll, no consecutive failures, no quota window or unverified
         recovery. Never applies inside a command-confirmation window (the caller skips this
         check there) or when the last poll failed."""
         if not self._demand_active(now):
+            return False
+        if not self._demand_phase_ok(now if arrived is None else arrived):
+            return False
+        setpoint = self._setpoint_seen.get(serial)
+        if isinstance(setpoint, (int, float)) and setpoint >= self.DEMAND_BOOST_SETPOINT_C:
             return False
         ts = self._last_successful_poll.get(serial)
         if ts is None or self._consecutive_failures.get(serial, 0) > 0:
@@ -983,6 +1017,10 @@ class MyThermowattBridge:
             if self._consecutive_failures.get(serial, 0) > 0:
                 if deadline_age - 1 <= age and age + self.DEMAND_RETRY_DELAY < self.OFFLINE_AFTER_S - 1:
                     cand = float(self.DEMAND_RETRY_DELAY)
+                elif (deadline_age - 1 <= age and self.DEMAND_RECOVERY_RETRY_S > 0
+                      and self._recovery_retry_ts.get(serial) != ts):
+                    self._recovery_retry_ts[serial] = ts      # spent once per last-success stamp
+                    cand = float(min(self.DEMAND_RECOVERY_RETRY_S, interval))
                 else:
                     return interval
             else:
@@ -1915,6 +1953,10 @@ class MyThermowattBridge:
                 prev_failures = self._consecutive_failures.get(serial, 0)
                 self._consecutive_failures[serial] = 0
                 self._last_successful_poll[serial]  = now
+                try:
+                    self._setpoint_seen[serial] = float(status_data.get('result', {}).get('T_SetPoint'))
+                except (TypeError, ValueError):
+                    self._setpoint_seen.pop(serial, None)
                 self._last_poll_error[serial]       = None
                 if prev_failures >= self.DEGRADED_THRESHOLD:
                     print(f"[POLL] {serial} recovered after {prev_failures} consecutive failures")
@@ -2099,6 +2141,7 @@ class MyThermowattBridge:
                     return
                 with self._config_lock:
                     self._demand_requested.add(serial)
+                    self._demand_arrived_at[serial] = self._last_demand_at
                 self._poll_wakeup.set()
                 return
 
@@ -2245,6 +2288,8 @@ class MyThermowattBridge:
             device_serials = list(self.config.get('devices', {}).keys())
             requested = set(self._demand_requested)
             self._demand_requested.clear()
+            arrived_at = dict(self._demand_arrived_at)
+            self._demand_arrived_at.clear()
 
         for serial in device_serials:
             if self._rate_limit_remaining() > 0:
@@ -2260,7 +2305,7 @@ class MyThermowattBridge:
                         print(f"[POLL] Refresh for {serial} coalesced: recent attempt "
                               f"{'gave' if fresh else 'gave no'} fresh telemetry")
                         continue
-                    if self._demand_reusable(serial, now):
+                    if self._demand_reusable(serial, now, arrived_at.get(serial, now)):
                         self._demand_stats["reused"] += 1
                         print(f"[POLL] Refresh for {serial} reused: healthy telemetry "
                               f"{now - self._last_successful_poll[serial]:.0f}s old, no request")

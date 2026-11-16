@@ -32,6 +32,7 @@ def bridge(monkeypatch, tmp_path):
 def da(bridge):
     """Demand-aware ON at the production interval, with HA actively requesting."""
     bridge.DEMAND_AWARE_FLAG = True
+    bridge.DEMAND_REUSE_PHASE_S = None       # phase gate has its own tests below; real clock here
     bridge.POLL_INTERVAL = 180
     bridge.current_poll_interval = 180
     bridge._last_demand_at = time.time()
@@ -256,8 +257,9 @@ def test_failed_deadline_poll_gets_exactly_one_quick_retry_inside_the_bound(da):
     da._consecutive_failures["SN"] = 1
     da._last_successful_poll["SN"] = time.time() - 290.4     # deadline poll just failed
     assert da._background_wait_s(180) == da.DEMAND_RETRY_DELAY
-    da._last_successful_poll["SN"] = time.time() - 296.0     # the retry also failed: bound is gone
-    assert da._background_wait_s(180) == 180
+    da._last_successful_poll["SN"] = time.time() - 296.0     # the retry also failed: bound is gone...
+    assert da._background_wait_s(180) == da.DEMAND_RECOVERY_RETRY_S     # ...one 30 s recovery retry
+    assert da._background_wait_s(180) == 180                  # ...then the legacy interval
     da._last_successful_poll["SN"] = time.time() - 60       # a demand-served poll failed early: legacy
     assert da._background_wait_s(180) == 180
 
@@ -367,3 +369,99 @@ def test_one_success_per_cycle_has_mean_gap_exactly_300_so_margin_needs_a_phase_
     assert 300 + a - lo > 300
     # extra polls per cycle for this margin: 1 per (run + 1) cycles
     assert 1 / (max_run + 1) == pytest.approx(1 / 9)
+
+
+# ---- reuse only for Package 19's pre-cycle refreshes (handback freshness wait) --------------
+
+GRID = 1794009600.0      # a multiple of 300 s: the :00 of a five-minute cycle
+
+
+@pytest.mark.parametrize("offset,expected", [
+    (272.2, True),      # primary :x4:30 + 2.2 s
+    (275.9, True),      # primary tail (measured max latency 3.79 s)
+    (290.2, True),      # conditional retry :x4:48 + 2.2 s
+    (298.0, True),
+    (266.0, True),      # lower edge
+    (265.9, False),
+    (10.0, False),      # translation event +8..11 s: the handback script's refresh
+    (60.0, False), (150.0, False), (0.0, False), (299.5, False),
+])
+def test_phase_gate_reuses_only_pre_cycle_refreshes(da, offset, expected):
+    da.DEMAND_REUSE_PHASE_S = type(da).DEMAND_REUSE_PHASE_S
+    healthy(da, 40)
+    now = GRID + offset
+    da._last_successful_poll["SN"] = now - 40
+    da._last_demand_at = now
+    assert da._demand_reusable("SN", now, arrived=now) is expected
+
+
+def test_handback_refresh_is_never_satisfied_by_an_old_sample(da):
+    """Package 19's handback script needs a poll stamped >= request - 10 s; a 38 s old sample at
+    the translation event (+10 s) must be refreshed, not reused."""
+    da.DEMAND_REUSE_PHASE_S = type(da).DEMAND_REUSE_PHASE_S
+    now = GRID + 10.0
+    da._last_successful_poll["SN"] = now - 38
+    da._consecutive_failures["SN"] = 0
+    da._last_demand_at = now
+    assert not da._demand_reusable("SN", now, arrived=now)
+
+
+def test_arrival_time_is_recorded_when_queued_not_when_processed(da):
+    da.on_mqtt_message(None, None, msg())
+    assert da._demand_arrived_at["SN"] == da._last_demand_at
+    da.poll_status = MagicMock(return_value=(True, 200))
+    da._run_poll_cycle()
+    assert da._demand_arrived_at == {}
+
+
+# ---- recovery retry after a failed deadline poll whose quick retry no longer fits --------------
+
+def test_recovery_retry_is_used_once_per_success_stamp(da):
+    da._consecutive_failures["SN"] = 1
+    ts = time.time() - 296.0                                    # connect-timeout failure ended at age ~296
+    da._last_successful_poll["SN"] = ts
+    assert da._background_wait_s(180) == da.DEMAND_RECOVERY_RETRY_S
+    assert da._background_wait_s(180) == 180                    # same stamp: legacy interval
+    da._last_successful_poll["SN"] = time.time() - 295.0        # a later success followed by a new failure
+    assert da._background_wait_s(180) == da.DEMAND_RECOVERY_RETRY_S
+
+
+def test_recovery_retry_can_be_disabled_and_never_exceeds_the_interval(da):
+    da._consecutive_failures["SN"] = 1
+    da._last_successful_poll["SN"] = time.time() - 296.0
+    da.DEMAND_RECOVERY_RETRY_S = 0
+    assert da._background_wait_s(180) == 180
+    da.DEMAND_RECOVERY_RETRY_S = 500
+    da._last_successful_poll["SN"] = time.time() - 297.0
+    assert da._background_wait_s(180) == 180
+
+
+def test_an_early_failure_never_gets_the_recovery_retry(da):
+    da._consecutive_failures["SN"] = 1
+    da._last_successful_poll["SN"] = time.time() - 60
+    assert da._background_wait_s(180) == 180
+
+
+# ---- owned boost: always a fresh sample ------------------------------------------------
+
+@pytest.mark.parametrize("setpoint,reusable", [(58.0, True), (64.9, True), (65.0, False), (70.0, False), (None, True)])
+def test_boost_setpoint_disables_reuse(da, setpoint, reusable):
+    healthy(da, 40)
+    if setpoint is None:
+        da._setpoint_seen.pop("SN", None)
+    else:
+        da._setpoint_seen["SN"] = setpoint
+    assert da._demand_reusable("SN", time.time()) is reusable
+
+
+def test_setpoint_is_recorded_from_each_validated_poll_only(da):
+    good = MagicMock(status_code=200)
+    good.json.return_value = {"result": {"WaterHeaterSts": 1, "T_Avg": 55.0, "T_SetPoint": 70.0, "Cmd": 9}}
+    with patch.object(da, "request", return_value=good), patch.object(da, "_save_config"):
+        assert da.poll_status("SN") == (True, 200)
+    assert da._setpoint_seen["SN"] == 70.0
+    bad = MagicMock(status_code=200)
+    bad.json.return_value = {"success": False, "error": "Water heater not found"}
+    with patch.object(da, "request", return_value=bad):
+        da.poll_status("SN")
+    assert da._setpoint_seen["SN"] == 70.0              # an invalid payload never overwrites it

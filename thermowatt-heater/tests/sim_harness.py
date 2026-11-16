@@ -81,7 +81,12 @@ class FakeCloud:
         self.rng = rng
         self.tokens = {}                 # access token -> exp
         self.refresh_ok = set()
-        self.heater = {"WaterHeaterSts": 0, "T_Avg": 52.0, "T_SetPoint": 58.0, "Cmd": 9}
+        self.heater = {"WaterHeaterSts": 0, "T_Avg": 58.0, "T_SetPoint": 58.0, "Cmd": 9}
+        # transport-failure kinds when a request fails: (name, seconds spent before the exception, weight).
+        # HTTP_TIMEOUT=(5, 15): a connect timeout costs 5 s, a read timeout 0.3 s connect + 15 s read.
+        self.fail_profile = [("reset", 0.3, 1.0)]
+        self.fault_hook = None            # callable(now, endpoint) -> None | ("slow", s) | (kind,) | ("quota",)
+        self.slow_windows = []            # (start, end, seconds): every response takes this long
         self.sent = {}                   # (day, category) -> n
         self.rejected = {}               # day -> n
         self.accepted_by_day = {}        # day -> n received & counted by quota
@@ -115,6 +120,19 @@ class FakeCloud:
                 p = pp
         return self.rng.random() < p
 
+    def _fail_kind(self):
+        total = sum(w for _, _, w in self.fail_profile)
+        x = self.rng.random() * total
+        for name, dur, w in self.fail_profile:
+            x -= w
+            if x <= 0:
+                return name, dur
+        return self.fail_profile[-1][:2]
+
+    def heater_update(self):
+        h = self.heater
+        h["WaterHeaterSts"] = 1 if (h["Cmd"] == 9 and h["T_SetPoint"] > h["T_Avg"]) else 0
+
     def _quota_rejects(self):
         now = self.w.clk.now
         if any(a <= now < b for a, b in self.quota_windows):
@@ -125,10 +143,22 @@ class FakeCloud:
 
     def handle(self, method, endpoint, headers, category):
         self._bump(category)
-        if self._transport_fail():
-            self.w.clk.sleep(5.0 if any(a <= self.w.clk.now < b for a, b in self.outages) else 0.3)
-            raise requests.exceptions.ConnectionError("RemoteDisconnected")
-        self.w.clk.sleep(self._rtt())
+        fault = self.fault_hook(self.w.clk.now, endpoint) if self.fault_hook else None
+        if fault is None and self._transport_fail():
+            if any(a <= self.w.clk.now < b for a, b in self.outages):
+                fault = ("connect",)
+            else:
+                fault = (self._fail_kind()[0],)
+        if fault is not None and fault[0] in ("reset", "connect", "read"):
+            dur = {"reset": 0.3, "connect": 5.0, "read": 15.3}[fault[0]]
+            self.w.clk.sleep(dur)
+            exc = {"reset": requests.exceptions.ConnectionError, "connect": requests.exceptions.ConnectTimeout,
+                   "read": requests.exceptions.ReadTimeout}[fault[0]]
+            raise exc(fault[0])
+        slow = next((sec for a, b, sec in self.slow_windows if a <= self.w.clk.now < b), None)
+        if fault is not None and fault[0] == "slow":
+            slow = fault[1]
+        self.w.clk.sleep(slow if slow is not None else self._rtt())
         if self._quota_rejects():
             self.rejected[self._day()] = self.rejected.get(self._day(), 0) + 1
             return Resp(200, {"success": False, "error": "Daily request limit exceeded"})
@@ -148,6 +178,7 @@ class FakeCloud:
             self._last_was_401 = True
             return Resp(401, {"error": "token expired"})
         if endpoint == "/status":
+            self.heater_update()
             if self._last_was_401:
                 self.replays += 1
             self._last_was_401 = False
@@ -157,6 +188,7 @@ class FakeCloud:
         if endpoint == "/manual":
             self.heater["Cmd"] = 9
             self.heater["T_SetPoint"] = float((self.w.last_json or {}).get("T_SetPoint", self.heater["T_SetPoint"]))
+            self.heater_update()
         elif endpoint == "/eco":
             self.heater["Cmd"] = 3
         elif endpoint == "/auto":
@@ -184,6 +216,16 @@ class World:
         self.avail = []                  # (t, state)
         self.refresh_publishes = 0
         self.native_changes = []         # (t, new_cmd)
+        self.p19 = False                 # model Package 19 template/translation/handback when enabled
+        self.wants = set()               # EMHASS cycle indexes that would select the HWS (price decision)
+        self.ownership = False
+        self.baseline = None
+        self.last_status = None          # last published STATUS result (what HA entities show)
+        self.avail_sensor = False        # rendered binary_sensor.ems_hws_current_action_available
+        self.handbacks = []              # per handback script run: outcome and timing
+        self.acquisitions = 0
+        self.gate_log = []               # per translation event: ages/eligibility evidence
+        self.handback_running = False
         self.commands = []               # (t, topic, payload)
         self._out = io.StringIO()
         self.poll_interval = poll_interval
@@ -227,13 +269,15 @@ class World:
             b.OFFLINE_SAFETY_MARGIN_S = self.cfg["margin"]
         b.config["devices"][SN] = {"name": "HWS", "last_setpoint": 58}
         b._save_config = lambda: None
-        if self.post_delay is not None:
-            real_diag = b._publish_diagnostics
+        real_diag = b._publish_diagnostics
 
-            def diag(serial, _real=real_diag):
+        def diag(serial, _real=real_diag):
+            if self.post_delay is not None:
                 self.clk.sleep(self.post_delay(self.rng))     # work between the success stamp and the next wait
-                return _real(serial)
-            b._publish_diagnostics = diag
+            out = _real(serial)
+            self.render()                                      # HA re-renders templates on entity changes
+            return out
+        b._publish_diagnostics = diag
         b._poll_wakeup = types.SimpleNamespace()
         ev = self._make_event()
         b._poll_wakeup = ev
@@ -242,6 +286,11 @@ class World:
             w.publishes.append((w.clk.now, topic, payload))
             if topic == f"P/{SN}/availability":
                 w.avail.append((w.clk.now, payload))
+            if topic == f"P/{SN}/STATUS":
+                try:
+                    w.last_status = json.loads(payload)["result"]
+                except Exception:
+                    pass
             return MagicMock()
         b.mqtt_client.publish.side_effect = pub
 
@@ -294,6 +343,9 @@ class World:
         return Ev()
 
     def close(self):
+        if getattr(self, "_closed", False):
+            return                      # idempotent: the module-level time/CONFIG_FILE patches must be undone once
+        self._closed = True
         for p in reversed(self.patchers):
             p.stop()
 
@@ -359,6 +411,8 @@ class World:
         b = self.b
         self.schedule_ha()
         self.schedule_cycles()
+        if self.p19:
+            self.schedule_p19()
         with contextlib.redirect_stdout(self._out):
             for _ in range(200):                  # boot login, retried like _boot_authenticate_and_discover
                 try:
@@ -372,7 +426,13 @@ class World:
         return self
 
     # -- injected events ----------------------------------------------------
-    def command(self, t, topic_suffix, payload):
+    def command(self, t, topic_suffix, payload, immediate=False):
+        if immediate:
+            self.commands.append((self.clk.now, topic_suffix, payload))
+            self.b.on_mqtt_message(None, None, SimpleNamespace(
+                topic=f"P/{SN}/CMD/{topic_suffix}", payload=payload.encode(), retain=False))
+            return
+
         def fire():
             self.commands.append((self.clk.now, topic_suffix, payload))
             self.b.on_mqtt_message(None, None, SimpleNamespace(
@@ -384,6 +444,162 @@ class World:
             self.cloud.heater["Cmd"] = cmd
             self.native_changes.append((self.clk.now, cmd))
         self.at(t, fire)
+
+    # -- Package 19 model: template sensor, EMHASS run, translation, handback script ------------
+    def render(self):
+        """binary_sensor.ems_hws_current_action_available exactly as packages/19 renders it. HA
+        re-renders on dependency changes and at every minute boundary (it uses now())."""
+        if not self.p19:
+            return
+        t = self.clk.now
+        b = self.b
+        st = self.last_status
+        offline = b._availability_for(SN, t) == "offline"
+        heating = None if (st is None or offline) else bool(int(st.get("WaterHeaterSts", 0)) & 1)
+        if self.ownership:
+            self.avail_sensor = heating is True
+            return
+        lim = b._rate_limit_snapshot()["step"] > 0
+        failures = b._consecutive_failures.get(SN, 0)
+        poll_status = "rate_limited" if lim else ("degraded" if failures >= b.DEGRADED_THRESHOLD else "ok")
+        ts = b._last_successful_poll.get(SN)
+        age = (t - int(ts)) if ts is not None else None           # the sensor has 1 s resolution
+        fresh = poll_status == "ok" and failures == 0 and age is not None and age <= 120
+        cmd_ok = b._command_diagnostics(SN, t)[0] in ("idle", "confirmed")
+        mode_manual = st is not None and not offline and st.get("Cmd") == 9
+        ok = (mode_manual and fresh and cmd_ok and heating is False and st is not None
+              and 50 <= float(st["T_Avg"]) <= 62 and 20 <= float(st["T_SetPoint"]) <= 70)
+        self.avail_sensor = bool(ok)
+
+    def schedule_p19(self):
+        k = 0
+        while T0 + 60 * k <= self.end:
+            self.at(T0 + 60 * k + 0.2, self.render)               # minute tick
+            self.at(T0 + 60 * k + 30, self.heater_tick)
+            k += 1
+        k = 1
+        while T0 + 300 * k <= self.end:
+            T = T0 + 300 * k
+            idx = k
+            delta = self.rng.uniform(8.0, 11.0)                    # historic run-to-publish delay
+            self.at(T + 3.0, lambda idx=idx: self.emhass_snapshot(idx))
+            self.at(T + delta, lambda idx=idx, T=T, d=delta: self.translation(idx, T, d))
+            k += 1
+        for a, b in self.ha_down:                                  # restart-handback automation at HA start
+            self.at(b + 30, lambda: self.ha_start_handback())
+
+    def heater_tick(self):
+        h = self.cloud.heater
+        if h["WaterHeaterSts"]:
+            h["T_Avg"] += 0.14
+        else:
+            h["T_Avg"] += (58.0 - h["T_Avg"]) * 0.03
+        self.cloud.heater_update()
+
+    def emhass_snapshot(self, idx):
+        self._snap_avail = self.avail_sensor
+
+    def translation(self, idx, T, delta):
+        t = self.clk.now
+        if self._ha_down(t):
+            return
+        selected = idx in self.wants and getattr(self, "_snap_avail", False)
+        b = self.b
+        ts = b._last_successful_poll.get(SN)
+        true_age = (t - ts) if ts is not None else None
+        self.gate_log.append({"t": t, "cycle": idx, "sensor": self.avail_sensor, "true_age": true_age,
+                              "selected": selected, "ownership": self.ownership})
+        if selected and not self.ownership and self.avail_sensor:
+            self.acquisitions += 1
+            self.baseline = float(self.last_status["T_SetPoint"])
+            self.ownership = True
+            self.render()
+            self.command(t, "TEMP", "70", immediate=True)
+        elif (not selected) and self.ownership:
+            self.start_handback()
+
+    def ha_start_handback(self):
+        if self.ownership:
+            self.start_handback()
+
+    def _cmd_confirmed(self, requested):
+        rec = self.b._command_state.get(SN, {}).get("TEMP")
+        return bool(rec and rec.get("status") == "confirmed" and float(rec.get("requested")) == float(requested))
+
+    def wait_until(self, cond, timeout, cb):
+        t_end = self.clk.now + timeout
+
+        def chk():
+            if cond():
+                cb(True)
+            elif self.clk.now >= t_end:
+                cb(False)
+            else:
+                self.at(self.clk.now + 0.5, chk)
+        chk()
+
+    def start_handback(self):
+        """script.hws_thermowatt_handback: refresh + wait (20 s) -> [TEMP 50 + wait 60 s] -> baseline TEMP
+        + wait 60 s -> ownership off. Every wait has continue_on_timeout: true followed by a
+        wait.completed condition, i.e. a timeout halts the script with ownership retained."""
+        if self.handback_running:
+            return
+        self.handback_running = True
+        b = self.b
+        rec = {"t": self.clk.now, "phase": (self.clk.now - T0) % 300, "outcome": None, "refresh_polled": None}
+        self.handbacks.append(rec)
+        req = self.clk.now
+        polls_before = self.cloud.sent.get((self.cloud._day(), "status"), 0)
+
+        def finish(outcome):
+            rec["outcome"] = outcome
+            rec["end"] = self.clk.now
+            self.handback_running = False
+
+        b.on_mqtt_message(None, None, SimpleNamespace(topic=f"P/{SN}/refresh", payload=b"1", retain=False))
+
+        def refreshed():
+            ts = b._last_successful_poll.get(SN)
+            return (ts is not None and int(ts) >= int(req) - 10 and b._consecutive_failures.get(SN, 0) == 0
+                    and not b._rate_limit_snapshot()["step"] and b._availability_for(SN, self.clk.now) == "online")
+
+        def after_refresh(ok):
+            rec["refresh_polled"] = ok
+            if not ok:
+                return finish("halt_refresh_wait")
+            st = self.last_status or {}
+            heating = bool(int(st.get("WaterHeaterSts", 0)) & 1)
+            if heating and float(st.get("T_Avg", 0)) > 50:
+                if st.get("Cmd") != 9:
+                    self.ownership = False
+                    return finish("released_native_mode")
+                self.command(self.clk.now, "TEMP", "50", immediate=True)
+                self.wait_until(lambda: (not bool(int((self.last_status or {}).get("WaterHeaterSts", 1)) & 1))
+                                and self._cmd_confirmed(50), 60, after_soft_stop)
+            else:
+                baseline_step()
+
+        def after_soft_stop(ok):
+            if not ok:
+                return finish("halt_soft_stop_wait")
+            baseline_step()
+
+        def baseline_step():
+            st = self.last_status or {}
+            if st.get("Cmd") != 9:
+                self.ownership = False
+                return finish("released_native_mode")
+            self.command(self.clk.now, "TEMP", str(int(self.baseline)), immediate=True)
+            self.wait_until(lambda: float((self.last_status or {}).get("T_SetPoint", 0)) == self.baseline
+                            and self._cmd_confirmed(self.baseline), 60, after_baseline)
+
+        def after_baseline(ok):
+            if not ok:
+                return finish("halt_baseline_wait")
+            self.ownership = False
+            self.render()
+            finish("ok")
+        self.wait_until(refreshed, 20, after_refresh)
 
     # -- metrics --------------------------------------------------------------
     def per_day(self):
@@ -407,6 +623,19 @@ class World:
                 n += 1
             prev = s
         return n
+
+    def offline_seconds(self):
+        """Total time the bridge published the device offline (after the first online)."""
+        tot, since = 0.0, None
+        for t, st in self.avail:
+            if st == "offline" and since is None and any(x == "online" for _, x in self.avail if _ <= t):
+                since = t
+            elif st == "online" and since is not None:
+                tot += t - since
+                since = None
+        if since is not None:
+            tot += self.end - since
+        return tot
 
     def stale_cycles(self, exclude=()):
         return sum(1 for c in self.cycles
