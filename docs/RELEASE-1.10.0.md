@@ -1,36 +1,48 @@
-# Thermowatt 1.10.0 — staged release and controlled installation
+# Thermowatt 1.10.0 — supervised manual release with Auto update ON
 
-**Status: release candidate only. Do not merge this release branch or install the add-on until a contemporaneous live Home Assistant preflight has passed.** PR #25 Stage 3 runtime is already merged in `main` at `93bc67d5cc4ff977cf5db632a44eee117ae1c2b2`. Stage 3 was qualified using stubbed Docker services (scenarios A, B, C, D, F, G, H, S, S0). The real Thermowatt cloud and physical heater have **not** been qualified for Stage 3.
+**Status: draft release candidate. Not merged or installed.** PR #25 Stage 3 was merged to `main` at `93bc67d5cc4ff977cf5db632a44eee117ae1c2b2`. Nine stubbed Docker scenarios passed; the real cloud and physical heater have not been commissioned for Stage 3.
 
-The add-on version changes from 1.9.0 to **1.10.0**, with `demand_aware_polling: false`. **The operator has chosen to keep Home Assistant's add-on Auto update ON. Do not disable it as part of this rollout.** The `breaking_versions` entry intentionally blocks unattended installation across 1.10.0 so that the heater's physical-control state can be checked before the Supervisor recreates the container. This is a manual-install safety safeguard, not a claim that the default-off feature is a backwards-incompatible runtime change.
+The release changes the add-on version from **1.9.0 to 1.10.0**. The new `demand_aware_polling` option remains **false** and the installed `poll_interval: 180` must be preserved.
 
-**Future-release limitation:** Once 1.10.0 has been manually installed, Auto update remains enabled. A later release without a new intervening `breaking_versions` entry may therefore restart the add-on automatically, potentially during an owned boost or handback. Each future version must be reviewed for safe automatic restart or carry its own breaking-version/manual-update requirement; the 1.10.0 marker is not a permanent restart interlock.
+## Automatic-update constraint: do not rely on breaking_versions for the first upgrade
 
-## Mandatory live preflight — immediately before any update, option change or restart
+**Operator policy: Auto update stays ON. Do not disable it.**
 
-Inspect live Home Assistant state *at the time of the operation*:
+The Supervisor 2026.11.0 `auto_update_available` check reads `breaking_versions` from the **installed app's stored configuration**, not from the new store candidate. Installed Thermowatt 1.9.0 has no such marker. Therefore adding `breaking_versions: ["1.10.0"]` only to the proposed 1.10.0 config would **not block the first automatic upgrade**. The ineffective marker has been removed from this release candidate.
 
-1. `input_boolean.ems_hws_ownership_active` is **off**. If **on**, stop; permit normal confirmed handback. Never restart the bridge during an outstanding owned boost.
-2. `script.hws_thermowatt_handback` is **off**, the HWS translation automation is idle (not mid-cycle), and `sensor.p_deferrable0_state` is **off**.
-3. `sensor.outside_hws_hws_command_status` is `idle` or `confirmed`, with no pending MODE/TEMP command and no 60-second confirmation window.
-4. `water_heater.hws_boiler_hws` reports the expected native Manual mode and physical baseline setpoint; compare against `input_number.ems_hws_captured_baseline_setpoint_c` if present. Do not assume a particular temperature.
-5. `sensor.outside_hws_hws_poll_status` is healthy, failures are zero, the most recent real poll is fresh and there is no active or unverified rate-limit recovery.
-6. Record the add-on's **currently installed version**, full options, relevant HWS entity states, diagnostics, and a restorable backup. Leave Auto update enabled as requested. Before merging the 1.10.0 release, verify that Supervisor recognises its breaking-version boundary and will require manual installation; if this cannot be verified, do not publish the release.
+Supervisor has a one-day age condition before its automatic-update task installs a newly recognised version. **This is a short operational window, not a guaranteed restart interlock.** Once the new version is visible in the store, leaving it uninstalled risks an unattended restart, even while a heater handback is in progress. Reverting `main` may not immediately invalidate a cached or already scheduled update. **Do not merge this release PR unless the operator can manually complete the installation and verify the new version in the same supervised session.**
 
-If any condition is unknown, unavailable or false, **do not update or restart**. Do not attempt to fix a stuck handback by restarting the bridge.
+Future releases with Auto update ON may restart the bridge automatically. Their safety must be reviewed separately; a marker added only to the future version is not a reliable safeguard for an already installed predecessor.
 
-## Controlled release / installation
+## Mandatory fresh live preflight — immediately before release and again before installation
 
-1. Review and approve this release candidate separately from PR #25. Ensure the version bump is the only runtime packaging change. Do not merge or expose the update until the manual-install safeguard and HA state have been confirmed.
-2. Merge the release PR under operator control, refresh the add-on repository listing, and manually install the 1.10.0 update only after repeating the preflight immediately before installation. Installation replaces/restarts the add-on container; it is **not** a no-op.
-3. Preserve existing options and keep `demand_aware_polling: false`. Do not introduce the Package 19 precycle marker or acquisition budget gate during the initial update.
-4. After installation, verify the actual installed version is 1.10.0 and the effective log reports `demand-aware polling: 0`. Confirm one healthy post-start real status poll, correct discovered entities, ownership still off, baseline intact, no unexpected MODE/TEMP commands, and availability online within six minutes.
-5. Observe the default-OFF bridge for at least one hour. The current operating cadence and API rate should match the existing options; do not assume 60-second polling if the installed `poll_interval` differs.
-6. Only in a separately approved commissioning stage: apply the Package 19 `precycle` marker, then repeat the full restart preflight, switch the demand-aware option on, and run an **ownership-OFF supervised trial for at least 48 hours** against the telemetry freshness, request budget and offline thresholds documented in `STAGE3-DEMAND-AWARE-POLLING.md` §9.
-7. **Do not enable automatic HWS ownership** until the separate acquisition-gate policy, quota risk, real handback tests and explicit operator approval are complete.
+Read current Home Assistant states and add-on diagnostics (do not rely on an earlier inspection).
 
-## Stop and rollback rules
+1. `input_boolean.ems_hws_ownership_active` is **off**; otherwise stop and allow a confirmed normal handback.
+2. `script.hws_thermowatt_handback` and the translation / precycle automations are idle, and `sensor.p_deferrable0_state` is **off**. Work outside an active five-minute HWS cycle.
+3. `sensor.outside_hws_hws_command_status` is `idle` or `confirmed`, with no pending MODE/TEMP command or confirmation window.
+4. `water_heater.hws_boiler_hws` reports the normal native **Manual** mode and baseline setpoint matching `input_number.ems_hws_captured_baseline_setpoint_c` where available (58 °C at the 2026-11-17 observation; do not assume this cannot change).
+5. Poll status is **ok**, consecutive failures are zero, last validated device poll is fresh, rate-limit backoff is inactive and recovery is verified.
+6. Record the installed add-on version, options and request totals. Keep **Auto update ON**, `poll_interval: 180`, `proactive_token_refresh: false` and `demand_aware_polling: false`. Verify an available, completed and recoverable backup containing the add-on. Prefer a fresh backup just before installation.
+7. Check recent UTC-day API request count and historical quota onset. The observed first-rejection count of 469 in three episodes is **not** a contract; do not install near a likely quota window.
 
-Stop commissioning for stale telemetry outside quota backoff, a failed or pending handback, unexpected commands or setpoints, unexplained offline status, quota onset during an owned boost, or inconsistent ownership state. Only change options or restart **after a fresh successful restart preflight**. Returning `demand_aware_polling` to false is the first safe configuration rollback; the prior image may not be available as a downgrade and may require a new roll-forward release.
+If a critical value is unavailable, stale or unsafe, **NO-GO**. Never restart an owned or unconfirmed handback.
 
-See `docs/STAGE3-DEMAND-AWARE-POLLING.md` §§5, 6 and 9 for measured-model limitations, safety gates and monitoring thresholds. Neither this branch nor its existence constitutes permission to install or change the running heater.
+## Controlled same-session release and installation
+
+1. Have the manual installation operator and read-only HA supervisor/diagnostic access ready. Complete the preflight and obtain explicit approval for the live add-on update.
+2. Take a fresh Thermowatt-inclusive backup, verify it completed and record its ID and the current add-on options. Restore is untested; do not claim otherwise.
+3. Only now merge the version bump to `main` and refresh the Home Assistant add-on store listing. Do not leave the update published unattended.
+4. **Repeat the full live preflight immediately before initiating the manual update.** If it fails, stop and investigate the published update risk. Do not rely solely on reverting the repository to protect the running system.
+5. Install **1.10.0 manually** with Auto update ON and Stage 3 option **OFF**. Preserve existing options; the update recreates/restarts the add-on container and is not a no-op.
+6. Verify installed version 1.10.0, effective `demand-aware polling: 0`, a successful real status poll, HA entity availability within six minutes, unchanged ownership OFF and baseline, zero unexpected MODE/TEMP commands, and no new quota backoff.
+7. Observe at least one hour with the existing 180 s cadence and measure the API request rate, errors, stale telemetry, and mode/setpoint stability.
+8. A separate approved stage may deploy Package 19's `precycle` marker and enable demand-aware polling under supervision **with HWS ownership OFF for at least 48 hours**. Automatic ownership / boosts remain unapproved until acquisition-gate, quota and real handback checks pass.
+
+## Stops, rollback, and open risks
+
+Stop for ownership ON, an active or unresolved handback, unexpected commands/setpoints, stale or unvalidated polling, quota backoff, or abnormal restarts. Never restart to fix an owned heater without the Package 19 recovery runbook. Disabling the option is the preferred configuration rollback **only after a safe restart preflight**; downgrading an add-on image may not be supported, and a roll-forward release or tested backup restore may be needed.
+
+If the release is merged but manual installation cannot proceed, investigate promptly while the installed state is still safe. Reverting the commit may reduce update exposure, but **is not a verified way to cancel an update already detected or scheduled by Supervisor**.
+
+This is an installation plan, **not permission to merge or deploy unattended**. See `docs/STAGE3-DEMAND-AWARE-POLLING.md` §9 for Stage 3 commissioning thresholds.
