@@ -2,7 +2,9 @@
 
 **Status: release candidate only. Do not merge this release branch or install the add-on until a contemporaneous live Home Assistant preflight has passed.** PR #25 Stage 3 runtime is already merged in `main` at `93bc67d5cc4ff977cf5db632a44eee117ae1c2b2`. Stage 3 was qualified using stubbed Docker services (scenarios A, B, C, D, F, G, H, S, S0). The real Thermowatt cloud and physical heater have **not** been qualified for Stage 3.
 
-The add-on version changes from 1.9.0 to **1.10.0**, with `demand_aware_polling: false`. The `breaking_versions` entry intentionally blocks unattended installation across 1.10.0 so that the heater's physical-control state can be checked before the Supervisor recreates the container. This is a manual-install safety safeguard, not a claim that the default-off feature is a backwards-incompatible runtime change.
+The add-on version changes from 1.9.0 to **1.10.0**, with `demand_aware_polling: false`. **The operator has chosen to keep Home Assistant's add-on Auto update ON. Do not disable it as part of this rollout.** The `breaking_versions` entry intentionally blocks unattended installation across 1.10.0 so that the heater's physical-control state can be checked before the Supervisor recreates the container. This is a manual-install safety safeguard, not a claim that the default-off feature is a backwards-incompatible runtime change.
+
+**Future-release limitation:** Once 1.10.0 has been manually installed, Auto update remains enabled. A later release without a new intervening `breaking_versions` entry may therefore restart the add-on automatically, potentially during an owned boost or handback. Each future version must be reviewed for safe automatic restart or carry its own breaking-version/manual-update requirement; the 1.10.0 marker is not a permanent restart interlock.
 
 ## Mandatory live preflight — immediately before any update, option change or restart
 
@@ -13,7 +15,7 @@ Inspect live Home Assistant state *at the time of the operation*:
 3. `sensor.outside_hws_hws_command_status` is `idle` or `confirmed`, with no pending MODE/TEMP command and no 60-second confirmation window.
 4. `water_heater.hws_boiler_hws` reports the expected native Manual mode and physical baseline setpoint; compare against `input_number.ems_hws_captured_baseline_setpoint_c` if present. Do not assume a particular temperature.
 5. `sensor.outside_hws_hws_poll_status` is healthy, failures are zero, the most recent real poll is fresh and there is no active or unverified rate-limit recovery.
-6. Record the add-on's **currently installed version**, full options, relevant HWS entity states, diagnostics, and a restorable backup. Confirm there is no auto-update path that bypasses this preflight.
+6. Record the add-on's **currently installed version**, full options, relevant HWS entity states, diagnostics, and a restorable backup. Leave Auto update enabled as requested. Before merging the 1.10.0 release, verify that Supervisor recognises its breaking-version boundary and will require manual installation; if this cannot be verified, do not publish the release.
 
 If any condition is unknown, unavailable or false, **do not update or restart**. Do not attempt to fix a stuck handback by restarting the bridge.
 
