@@ -1,9 +1,6 @@
 name: "Thermowatt Smart Boiler"
 description: "Cloud-to-Local bridge for Thermowatt / Ariston water heaters."
 version: "1.10.0"
-# Require explicit manual update: restarting can interrupt an owned HWS handback.
-breaking_versions:
-  - "1.10.0"
 slug: "thermowatt_boiler"
 arch:
   - aarch64
