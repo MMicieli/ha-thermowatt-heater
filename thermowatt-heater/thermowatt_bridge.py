@@ -185,6 +185,47 @@ class MyThermowattBridge:
     DEMAND_RETRY_DELAY      = 5     # seconds — single transport-failure retry of a requested refresh
     DIAG_REFRESH_INTERVAL   = 60    # seconds — republish diagnostics during backoff (MQTT only)
 
+    # Demand-aware polling (issue #17, Stage 3). DEFAULT OFF: add-on option
+    # `demand_aware_polling` (run.sh exports THERMOWATT_DEMAND_AWARE=1 only when true).
+    # While Home Assistant keeps requesting pre-cycle refreshes, (1) a requested refresh is
+    # satisfied by a healthy poll that is already recent enough, instead of a duplicate
+    # request, and (2) the background poll becomes a *deadline* poll due
+    # OFFLINE_SAFETY_MARGIN_S before the fixed OFFLINE_AFTER_S bound, instead of a fixed
+    # interval restarted by every request. The 120 s freshness test and the fixed 300 s
+    # offline bound are not changed. See docs/STAGE3-DEMAND-AWARE-POLLING.md for the proof
+    # that one request per cycle cannot hold the 300 s bound and for the margin arithmetic.
+    DEMAND_AWARE_FLAG        = (os.environ.get("THERMOWATT_DEMAND_AWARE", "")
+                                .strip().lower() in ("1", "true", "yes", "on"))
+    DEMAND_AWARE_MIN_POLL_INTERVAL = 121   # Package 19 only requests refreshes while poll_interval > 120
+    # A requested refresh is reused when the last healthy poll is at most this old. Package 19
+    # requests at :30 (30 s before the cycle) and retries at :48, so the data is at most
+    # 80 s + 30 s = 110 s old when the cycle reads it: 10 s inside TELEMETRY_STALE_AFTER.
+    DEMAND_REUSE_MAX_AGE_S   = 80
+    # Reuse is granted ONLY by explicit intent. Package 19's pre-cycle automation publishes the
+    # payload below to P/<serial>/refresh. Anything else -- the handback script's and the HA-start
+    # recovery's plain "1", a manual publish, any unknown or undecodable payload -- is a forced
+    # refresh: it needs a real poll (subject only to the 10 s DEMAND_MIN_SPACING attempt coalescing),
+    # because the handback script waits for a poll stamped >= its request - 10 s. When requests for
+    # one device overlap before the poll loop runs, the forced intent always wins, in either order.
+    # Arrival time proves nothing about origin and is never used. A v1.9.0 bridge ignores the
+    # payload entirely, so publishing the marker to an old bridge is a plain refresh.
+    DEMAND_PRECYCLE_PAYLOAD  = "precycle"
+    # While the heater's observed setpoint is at or above this (Package 19's TEMP 70 boost; the native
+    # baseline is far lower), a requested refresh is always served: an owned boost gets fresh data at
+    # every cycle (age <= ~30 s as today). Costs ~2-5 requests/day on measured boost profiles. A
+    # baseline set above this simply keeps legacy cadence (the safe direction).
+    DEMAND_BOOST_SETPOINT_C  = 65.0
+    # Demand-aware behaviour applies only while refresh requests keep arriving (two missed
+    # five-minute cycles plus a minute); otherwise the legacy fixed interval applies.
+    DEMAND_ACTIVE_WINDOW_S   = 660
+    # Deadline poll is due this long before OFFLINE_AFTER_S: covers scheduling jitter, round
+    # trip and one DEMAND_RETRY_DELAY retry of a transport failure inside the 300 s bound.
+    OFFLINE_SAFETY_MARGIN_S  = 10
+    # A failed deadline poll whose 5 s retry no longer fits inside the 300 s bound (connect or
+    # read timeout: HTTP_TIMEOUT=(5, 15)) is retried once after this delay instead of after the
+    # legacy 180 s; a second failure falls back to the legacy interval. 0 disables.
+    DEMAND_RECOVERY_RETRY_S  = 20
+
     # CMD_COOLDOWN per command type — MODE and TEMP each have their own 15s window so a
     # valid paired sequence (MODE then TEMP, or vice versa) is never incorrectly blocked.
     CMD_COOLDOWN = 15  # seconds
@@ -230,6 +271,11 @@ class MyThermowattBridge:
         # Read-only refresh requests wake this same polling loop. No worker,
         # HTTP call or command queue is created on the MQTT callback thread.
         self._demand_requested = set()  # guarded by _config_lock
+        self._last_demand_at = None     # wall time of the last accepted-serial refresh request
+        self._demand_stats = {"served": 0, "reused": 0, "marked": 0, "forced": 0}   # in-memory commissioning evidence
+        self._demand_reuse_ok = {}      # serial -> True only while every pending request is a marked pre-cycle one
+        self._recovery_retry_ts = {}    # serial -> last_success stamp the recovery retry was spent on
+        self._setpoint_seen = {}        # serial -> T_SetPoint of the last validated status
         self._last_status_attempt = {}
 
         # Per-device command cooldown and confirmation state, keyed by command type.
@@ -892,6 +938,96 @@ class MyThermowattBridge:
         for serial in serials:
             self._publish_diagnostics(serial)
 
+    # ------------------------------------------------------------------ #
+    #  Demand-aware polling (issue #17, Stage 3; default off)              #
+    # ------------------------------------------------------------------ #
+
+    def _demand_aware_enabled(self) -> bool:
+        """Option on AND a poll_interval above Package 19's 120 s refresh gate.
+
+        Package 19 requests pre-cycle refreshes only while the poll-interval diagnostic is
+        above 120 s. Below that nothing would keep telemetry within 120 s of a cycle, so the
+        option is ignored (fail closed to the legacy cadence)."""
+        return bool(self.DEMAND_AWARE_FLAG) and self.POLL_INTERVAL >= self.DEMAND_AWARE_MIN_POLL_INTERVAL
+
+    def _demand_active(self, now=None) -> bool:
+        """True while Home Assistant is actually requesting refreshes (else legacy cadence)."""
+        if not self._demand_aware_enabled():
+            return False
+        last = self._last_demand_at
+        if last is None:
+            return False
+        now = time.time() if now is None else now
+        return 0 <= now - last <= self.DEMAND_ACTIVE_WINDOW_S
+
+    def _is_precycle_payload(self, payload) -> bool:
+        """Exactly the marker string; anything else (including None / undecodable) is not."""
+        try:
+            text = payload.decode("utf-8") if isinstance(payload, (bytes, bytearray)) else payload
+        except Exception:  # noqa: BLE001
+            return False
+        return isinstance(text, str) and text == self.DEMAND_PRECYCLE_PAYLOAD
+
+    def _demand_reusable(self, serial: str, now: float, marked: bool = False) -> bool:
+        """A requested refresh needs no request when healthy telemetry is recent enough.
+
+        Healthy = a validated poll, no consecutive failures, no quota window or unverified
+        recovery. Never applies inside a command-confirmation window (the caller skips this
+        check there) or when the last poll failed."""
+        if not self._demand_active(now):
+            return False
+        if not marked:
+            return False                      # forced refresh: never reuse
+        setpoint = self._setpoint_seen.get(serial)
+        if isinstance(setpoint, (int, float)) and setpoint >= self.DEMAND_BOOST_SETPOINT_C:
+            return False
+        ts = self._last_successful_poll.get(serial)
+        if ts is None or self._consecutive_failures.get(serial, 0) > 0:
+            return False
+        if self._rate_limit_snapshot()["step"] > 0:
+            return False
+        return 0 <= now - ts <= self.DEMAND_REUSE_MAX_AGE_S
+
+    def _background_wait_s(self, interval: float, now=None) -> float:
+        """Seconds to wait before the next unrequested poll.
+
+        Legacy behaviour (returns `interval`) unless demand-aware polling is active, the
+        loop is at the normal background interval (not command confirmation or a backoff
+        stretch), no quota recovery is unverified, and every device has a healthy poll.
+        Then the wait runs to the *deadline poll*: OFFLINE_SAFETY_MARGIN_S before the fixed
+        OFFLINE_AFTER_S bound counted from the last successful poll. A failed deadline poll
+        gets one DEMAND_RETRY_DELAY retry while it still fits inside the bound; any other
+        failure state, and the never-polled state, keep the legacy interval."""
+        if interval != self.POLL_INTERVAL:
+            return interval
+        now = time.time() if now is None else now
+        if not self._demand_active(now) or self._rate_limit_snapshot()["step"] > 0:
+            return interval
+        with self._config_lock:
+            serials = list(self.config.get("devices", {}).keys())
+        if not serials:
+            return interval
+        deadline_age = self.OFFLINE_AFTER_S - self.OFFLINE_SAFETY_MARGIN_S
+        wait = None
+        for serial in serials:
+            ts = self._last_successful_poll.get(serial)
+            if ts is None:
+                return interval
+            age = now - ts
+            if self._consecutive_failures.get(serial, 0) > 0:
+                if deadline_age - 1 <= age and age + self.DEMAND_RETRY_DELAY < self.OFFLINE_AFTER_S - 1:
+                    cand = float(self.DEMAND_RETRY_DELAY)
+                elif (deadline_age - 1 <= age and self.DEMAND_RECOVERY_RETRY_S > 0
+                      and self._recovery_retry_ts.get(serial) != ts):
+                    self._recovery_retry_ts[serial] = ts      # spent once per last-success stamp
+                    cand = float(min(self.DEMAND_RECOVERY_RETRY_S, interval))
+                else:
+                    return interval
+            else:
+                cand = max(deadline_age - age, 1.0)
+            wait = cand if wait is None else min(wait, cand)
+        return wait if wait is not None else interval
+
     def _wait_for_next_poll(self, interval: float):
         """Sleep until the next poll is due.
 
@@ -900,7 +1036,7 @@ class MyThermowattBridge:
         command-triggered fast polling nor a stale wake can reach the API early.
         Pending commands are still expired (and republished) on their deadline.
         """
-        end = time.time() + interval
+        end = time.time() + self._background_wait_s(interval)
         was_limited = False
         while True:
             now = time.time()
@@ -1060,7 +1196,10 @@ class MyThermowattBridge:
         if not token or not refresh:
             return
         exp = self._jwt_exp(token)
-        if exp is None or exp - time.time() > max(self.PROACTIVE_REFRESH_MARGIN_S, self.POLL_INTERVAL + 60):
+        wake_gap = self.POLL_INTERVAL
+        if self._demand_aware_enabled():
+            wake_gap = max(wake_gap, self.OFFLINE_AFTER_S - self.OFFLINE_SAFETY_MARGIN_S)
+        if exp is None or exp - time.time() > max(self.PROACTIVE_REFRESH_MARGIN_S, wake_gap + 60):
             return
         if self._proactive_attempt_exp == exp:
             return
@@ -1748,6 +1887,8 @@ class MyThermowattBridge:
             "rate_limit":           self._rate_limit_diagnostics(now),
             "requests":             self._requests_diagnostics(now),
             "proactive_token_refresh": bool(self.PROACTIVE_REFRESH),
+            "demand_aware_polling": self._demand_aware_enabled(),
+            "demand_refresh":       dict(self._demand_stats),
         }
         try:
             self.mqtt_client.publish(f"P/{serial}/diagnostics", json.dumps(payload), retain=True)
@@ -1791,7 +1932,10 @@ class MyThermowattBridge:
                 # heating. Cap at 2× the normal poll interval to bound the jump.
                 # Persisted in config.json so the counter survives bridge restarts.
                 if serial in self._last_poll_ts:
-                    elapsed_s = min(now - self._last_poll_ts[serial], 2 * self.POLL_INTERVAL)
+                    cap_s = 2 * self.POLL_INTERVAL
+                    if self._demand_aware_enabled():
+                        cap_s = max(cap_s, self.OFFLINE_AFTER_S)  # deadline polls are up to 290 s apart
+                    elapsed_s = min(now - self._last_poll_ts[serial], cap_s)
                     elapsed_h = elapsed_s / 3600.0
                     if status_data.get('result', {}).get('heating'):
                         with self._config_lock:
@@ -1809,6 +1953,10 @@ class MyThermowattBridge:
                 prev_failures = self._consecutive_failures.get(serial, 0)
                 self._consecutive_failures[serial] = 0
                 self._last_successful_poll[serial]  = now
+                try:
+                    self._setpoint_seen[serial] = float(status_data.get('result', {}).get('T_SetPoint'))
+                except (TypeError, ValueError):
+                    self._setpoint_seen.pop(serial, None)
                 self._last_poll_error[serial]       = None
                 if prev_failures >= self.DEGRADED_THRESHOLD:
                     print(f"[POLL] {serial} recovered after {prev_failures} consecutive failures")
@@ -1984,12 +2132,20 @@ class MyThermowattBridge:
                 # Read-only request: no cloud I/O here, no new mode of control.
                 # The normal poll loop alone can perform quota-recovery probes.
                 serial = parts[1]
+                with self._config_lock:
+                    known = serial in self.config.get("devices", {})
+                if not known:
+                    return
+                self._last_demand_at = time.time()  # HA is alive and asking (even while backing off)
                 if self._rate_limit_snapshot()["step"] > 0:
                     return
+                marked = self._is_precycle_payload(getattr(msg, "payload", None))
                 with self._config_lock:
-                    if serial not in self.config.get("devices", {}):
-                        return
+                    pending = serial in self._demand_requested
+                    # forced intent wins whatever the order; a marked request never upgrades a forced one
+                    self._demand_reuse_ok[serial] = marked and (self._demand_reuse_ok.get(serial, False) if pending else True)
                     self._demand_requested.add(serial)
+                self._demand_stats["marked" if marked else "forced"] += 1
                 self._poll_wakeup.set()
                 return
 
@@ -2136,6 +2292,8 @@ class MyThermowattBridge:
             device_serials = list(self.config.get('devices', {}).keys())
             requested = set(self._demand_requested)
             self._demand_requested.clear()
+            reuse_ok = dict(self._demand_reuse_ok)
+            self._demand_reuse_ok.clear()
 
         for serial in device_serials:
             if self._rate_limit_remaining() > 0:
@@ -2151,6 +2309,12 @@ class MyThermowattBridge:
                         print(f"[POLL] Refresh for {serial} coalesced: recent attempt "
                               f"{'gave' if fresh else 'gave no'} fresh telemetry")
                         continue
+                    if self._demand_reusable(serial, now, reuse_ok.get(serial, False)):
+                        self._demand_stats["reused"] += 1
+                        print(f"[POLL] Refresh for {serial} reused: healthy telemetry "
+                              f"{now - self._last_successful_poll[serial]:.0f}s old, no request")
+                        continue
+                    self._demand_stats["served"] += 1
                 elif requested and now - last < self.current_poll_interval - 5:
                     continue  # demand wake for another device; this one is not due
             # One bounded retry, only for a requested refresh whose request ended
@@ -2284,7 +2448,10 @@ class MyThermowattBridge:
         self.mqtt_client.on_message = self.on_mqtt_message
         self.mqtt_client.loop_start()
 
-        print(f"OK: Step 6 - Polling loop starting (background={self.POLL_INTERVAL}s, confirm={self.POLL_INTERVAL_CONFIRM}s, degraded_threshold={self.DEGRADED_THRESHOLD}).")
+        print(f"OK: Step 6 - Polling loop starting (background={self.POLL_INTERVAL}s, confirm={self.POLL_INTERVAL_CONFIRM}s, degraded_threshold={self.DEGRADED_THRESHOLD}, demand_aware={self._demand_aware_enabled()}).")
+        if self.DEMAND_AWARE_FLAG and not self._demand_aware_enabled():
+            print(f"[WARN] demand_aware_polling ignored: needs poll_interval >= {self.DEMAND_AWARE_MIN_POLL_INTERVAL} s "
+                  f"(Package 19 requests refreshes only above 120 s); using the legacy cadence.")
 
         while True:
             try:

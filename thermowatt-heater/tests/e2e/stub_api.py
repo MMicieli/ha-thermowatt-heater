@@ -17,8 +17,14 @@ STATE = {"setpoint": 60, "cmd": 9, "t_avg": 55.0}
 LOCK = threading.Lock()
 
 
+# Stage 3 (scenarios S/S0): event-driven fault injection through control files touched by the harness,
+# so the timeline never depends on guessing the stub's own clock. Absent files = original behaviour.
+SLOW_DELAY = float(os.environ.get("SLOW_DELAY", "16"))      # > the bridge's 15 s read timeout
+SLOW_FILE, LIMIT_FILE = "/tmp/slow", "/tmp/limit"
+
+
 def log(**kw):
-    kw["t"] = round(time.time() - T0, 1) if T0 else 0
+    kw.setdefault("t", round(time.time() - T0, 1) if T0 else 0)
     print(json.dumps(kw), flush=True)
 
 
@@ -45,25 +51,34 @@ class H(BaseHTTPRequestHandler):
 
     def _send(self, code, body=None):
         raw = b"" if body is None else json.dumps(body).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json" if body is not None else "text/plain")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json" if body is not None else "text/plain")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+        except (BrokenPipeError, ConnectionError):   # the client already gave up (read timeout)
+            pass
 
     def _handle(self):
         global T0, REFRESH_SEEN
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else b""
+        delayed = None
+        if self.path.split("/api/v1", 1)[-1] == "/status" and os.path.exists(SLOW_FILE):
+            delayed = round(time.time() - T0, 1) if T0 else 0   # arrival time; answered after the read timeout
+            time.sleep(SLOW_DELAY)
         with LOCK:
             if T0 is None:
                 T0 = time.time()
             now = time.time() - T0
             path = self.path.split("/api/v1", 1)[-1]
-            limited = LIMIT_FROM >= 0 and LIMIT_FROM <= now < LIMIT_UNTIL
+            limited = (LIMIT_FROM >= 0 and LIMIT_FROM <= now < LIMIT_UNTIL) or os.path.exists(LIMIT_FILE)
             extra = {}
             if JWT_LIFETIME > 0 and path not in ("/login", "/refresh"):
                 extra["auth"] = token_state(self.headers.get("Authorization"))
+            if delayed is not None:
+                extra["t"], extra["slow"] = delayed, True
             log(m=self.command, p=path, limited=limited,
                 body="<redacted>" if path in ("/login", "/refresh") else body.decode()[:80], **extra)
             if limited:

@@ -16,6 +16,16 @@ else
 fi
 export THERMOWATT_PROACTIVE_REFRESH
 
+# Demand-aware polling (issue #17 Stage 3) is OFF unless the add-on option is explicitly
+# true; absent/false/malformed exports 0. The bridge additionally ignores it unless
+# poll_interval is above 120 s.
+if bashio::config.true 'demand_aware_polling'; then
+    THERMOWATT_DEMAND_AWARE=1
+else
+    THERMOWATT_DEMAND_AWARE=0
+fi
+export THERMOWATT_DEMAND_AWARE
+
 # Background poll interval in seconds. Absent/"null" is left to the bridge, which
 # falls back to 60 s (also rejecting anything outside 60-300).
 THERMOWATT_POLL_INTERVAL="$(bashio::config 'poll_interval')"
@@ -32,6 +42,6 @@ MQTT_PORT="$(bashio::services mqtt "port")"
 MQTT_USER="$(bashio::services mqtt "username")"
 MQTT_PASSWORD="$(bashio::services mqtt "password")"
 
-bashio::log.info "Starting Thermowatt Bridge for $EMAIL (proactive token refresh: $THERMOWATT_PROACTIVE_REFRESH, poll interval option: $THERMOWATT_POLL_INTERVAL)..."
+bashio::log.info "Starting Thermowatt Bridge for $EMAIL (proactive token refresh: $THERMOWATT_PROACTIVE_REFRESH, poll interval option: $THERMOWATT_POLL_INTERVAL, demand-aware polling: $THERMOWATT_DEMAND_AWARE)..."
 
 python3 -u /thermowatt_bridge.py "$EMAIL" "$PASSWORD"
